@@ -10,13 +10,14 @@ from expensir.core.locking import per_group_lock
 from expensir.core.outbound import OutboundAction, SendMessage
 from expensir.db.models import Group, Ledger, User
 from expensir.domain.apply import AppliedExpense, ApplyContext, apply_intent
+from expensir.domain.balances import net_positions
 from expensir.domain.currency import resolve_currency
 from expensir.domain.errors import Rejection
-from expensir.domain.identity import ensure_group, register_member
+from expensir.domain.identity import display_names, ensure_group, register_member
 from expensir.domain.money import to_minor
-from expensir.format.render import expense_reply
-from expensir.intents.commands import parse_equal, parse_homecurrency
-from expensir.intents.schema import AddExpense, SetHomeCurrency, SplitMember
+from expensir.format.render import balance_reply, expense_reply
+from expensir.intents.commands import parse_balance, parse_equal, parse_homecurrency
+from expensir.intents.schema import AddExpense, SetHomeCurrency, ShowBalance, SplitMember
 
 CommandRunner = Callable[[dict[str, Any], AsyncSession, Group, User | None], Awaitable[str]]
 
@@ -74,7 +75,11 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
             active = await session.get_one(Ledger, group.active_ledger_id)
             text = f"📒 {active.name} • Expensir is ready — try /equal, or /balance."
             return [SendMessage(chat_id=message["chat"]["id"], text=text)]
-        runner = {"homecurrency": _run_homecurrency, "equal": _run_equal}.get(command or "")
+        runner = {
+            "homecurrency": _run_homecurrency,
+            "equal": _run_equal,
+            "balance": _run_balance,
+        }.get(command or "")
         if runner is not None:
             text = await _run_command(runner, message, session, group, actor)
             return [SendMessage(chat_id=message["chat"]["id"], text=text)]
@@ -145,6 +150,23 @@ async def _run_equal(
         participant_names=[u.display_name for u in applied.participants],
         rounded_from=parsed.amount if was_rounded else None,
     )
+
+
+async def _run_balance(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> str:
+    intent = ShowBalance(scope=parse_balance(message["text"]))
+    # a read: no lock, no action row, sealed to the active ledger (§0.7, §0.10, §8)
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    net = await net_positions(session, ledger.id)
+    if intent.scope == "me":
+        if actor is None:
+            raise Rejection("I can't tell who you are — anonymous admins have no balance.")
+        entries = [(actor.display_name, net.get(actor.id, {}))]
+        return balance_reply(ledger_name=ledger.name, entries=entries, as_me=True)
+    names = await display_names(session, list(net))
+    entries = [(names[user_id], by_currency) for user_id, by_currency in net.items()]
+    return balance_reply(ledger_name=ledger.name, entries=entries)
 
 
 async def _register_author(

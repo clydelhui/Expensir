@@ -98,6 +98,11 @@ async def _member_by_username(session: AsyncSession, group_id: int, username: st
     return members[0] if members else None
 
 
+async def display_names(session: AsyncSession, user_ids: list[int]) -> dict[int, str]:
+    users = (await session.execute(select(User).where(User.id.in_(user_ids)))).scalars()
+    return {u.id: u.display_name for u in users}
+
+
 async def registered_members(session: AsyncSession, group_id: int) -> list[User]:
     """Everyone currently registered here (§11): the meaning of empty participants."""
     return list(

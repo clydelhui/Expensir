@@ -29,8 +29,16 @@ class SetHomeCurrency(BaseModel):
     currency: str
 
 
+class ShowBalance(BaseModel):
+    """A read: never confirms, writes no action row (§0.7, §8). Active ledger only."""
+
+    kind: Literal["show_balance"] = "show_balance"
+    scope: Literal["me", "group"] = "group"
+    convert_to: str | None = None  # /convert <TARGET>; arrives with the FX slice
+
+
 # grows into the full §4 discriminated union as slices add kinds
 Intent = Annotated[
-    AddExpense | SetHomeCurrency,
+    AddExpense | SetHomeCurrency | ShowBalance,
     Field(discriminator="kind"),
 ]

@@ -64,3 +64,8 @@ async def test_mutating_commands_acquire_the_group_lock(deps, monkeypatch):
         group = (await session.execute(select(Group))).scalar_one()
     assert len(locked) >= 2  # both mutating commands took the lock
     assert set(locked) == {group.id}
+
+    # reads must NOT serialize against writes (§0.11): /balance takes no lock
+    locked.clear()
+    await dispatch(message_update(update_id=5, chat_id=-42, text="/balance"), deps)
+    assert locked == []

@@ -6,9 +6,11 @@ which the core looks up (ledger logging -> group home, §3) before building the 
 
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 EQUAL_USAGE = "Usage: /equal <amount> [ISO] <description> [@name ...]"
 HOMECURRENCY_USAGE = "Usage: /homecurrency <ISO>, e.g. /homecurrency USD"
+BALANCE_USAGE = "Usage: /balance — everyone's position, or /balance me for yours"
 
 _AMOUNT = re.compile(r"^\d+(\.\d+)?$")
 _UPPER_ISO = re.compile(r"^[A-Z]{3}$")
@@ -47,6 +49,15 @@ def parse_equal(text: str) -> ParsedExpense:
         description=description,
         participant_refs=participant_refs,
     )
+
+
+def parse_balance(text: str) -> Literal["me", "group"]:
+    tokens = text.split()[1:]
+    if not tokens:
+        return "group"
+    if tokens == ["me"]:
+        return "me"
+    raise ValueError(BALANCE_USAGE)
 
 
 def parse_homecurrency(text: str) -> str:

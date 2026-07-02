@@ -31,3 +31,26 @@ def join_names(names: list[str]) -> str:
     if len(names) <= 1:
         return "".join(names)
     return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def balance_reply(
+    *,
+    ledger_name: str,
+    entries: list[tuple[str, dict[str, int]]],  # (name, currency -> net minor, + owes the pool)
+    as_me: bool = False,  # scope=me: a single entry, phrased as "you"
+) -> str:
+    lines: list[str] = []
+    for currency in sorted({c for _, by_ccy in entries for c in by_ccy}):
+        nets = [(name, by_ccy[currency]) for name, by_ccy in entries if by_ccy.get(currency)]
+        # debtors first, largest debt first; stable by name within ties
+        for name, net in sorted(nets, key=lambda item: (-item[1], item[0])):
+            amount = fmt(abs(net), currency)
+            if as_me:
+                lines.append(f"You owe {amount}" if net > 0 else f"You're owed {amount}")
+            else:
+                verb = "owes" if net > 0 else "is owed"
+                lines.append(f"{name} {verb} {amount}")
+    if not lines:
+        settled = "You're all settled up" if as_me else "All settled up"
+        return f"📒 {ledger_name} • {settled}."
+    return f"📒 {ledger_name} • Balances\n" + "\n".join(lines)
