@@ -1,13 +1,24 @@
 """Transport-agnostic entrypoint: dispatch(update_dict) -> list[OutboundAction] (§0.5)."""
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expensir.core.locking import per_group_lock
 from expensir.core.outbound import OutboundAction, SendMessage
-from expensir.db.models import Ledger
+from expensir.db.models import Group, Ledger, User
+from expensir.domain.apply import AppliedExpense, ApplyContext, apply_intent
+from expensir.domain.currency import resolve_currency
+from expensir.domain.errors import Rejection
 from expensir.domain.identity import ensure_group, register_member
+from expensir.domain.money import to_minor
+from expensir.format.render import expense_reply
+from expensir.intents.commands import parse_equal, parse_homecurrency
+from expensir.intents.schema import AddExpense, SetHomeCurrency, SplitMember
+
+CommandRunner = Callable[[dict[str, Any], AsyncSession, Group, User | None], Awaitable[str]]
 
 WELCOME = (
     "👋 Expensir is on the case!\n"
@@ -54,22 +65,95 @@ async def _handle_bot_added(my_chat_member: dict[str, Any], deps: Deps) -> list[
 async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[OutboundAction]:
     async with deps.session_factory() as session, session.begin():
         group = await ensure_group(session, message["chat"]["id"], message["chat"].get("title"))
+        actor = None
         if "from" in message:
-            await _register_author(session, group.id, message["from"])
+            actor = await _register_author(session, group.id, message["from"])
 
-        if _command_of(message.get("text", ""), deps.bot_username) == "start":
+        command = _command_of(message.get("text", ""), deps.bot_username)
+        if command == "start":
             active = await session.get_one(Ledger, group.active_ledger_id)
             text = f"📒 {active.name} • Expensir is ready — try /equal, or /balance."
+            return [SendMessage(chat_id=message["chat"]["id"], text=text)]
+        runner = {"homecurrency": _run_homecurrency, "equal": _run_equal}.get(command or "")
+        if runner is not None:
+            text = await _run_command(runner, message, session, group, actor)
             return [SendMessage(chat_id=message["chat"]["id"], text=text)]
 
     return []
 
 
-async def _register_author(session: AsyncSession, group_id: int, tg_user: dict[str, Any]) -> None:
+async def _run_command(
+    runner: CommandRunner,
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+) -> str:
+    """Run a mutating command; on rejection every write it made rolls back (§0.9).
+
+    The savepoint scopes the rollback to the command itself — the author
+    registration earlier in this transaction still commits.
+    """
+    try:
+        async with session.begin_nested():
+            return await runner(message, session, group, actor)
+    except (Rejection, ValueError) as exc:
+        return str(exc)
+
+
+async def _run_homecurrency(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> str:
+    currency = parse_homecurrency(message["text"])
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    await apply_intent(SetHomeCurrency(currency=currency), ctx)
+    return (
+        f"🏠 Home currency set to {currency} — "
+        f"other currencies will show a ≈ {currency} equivalent."
+    )
+
+
+async def _run_equal(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> str:
+    parsed = parse_equal(message["text"])
+    # lock before resolving the currency: it depends on the active ledger, which a
+    # concurrent /switch could repoint between our read and the write (ADR-0003)
+    await per_group_lock(session, group.id)
+    await session.refresh(group)
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    currency = resolve_currency(parsed.currency, ledger.logging_currency, group.home_currency)
+    amount_minor, was_rounded = to_minor(parsed.amount, currency)
+
+    intent = AddExpense(
+        payer_ref="me",
+        amount_minor=amount_minor,
+        currency=currency,
+        description=parsed.description,
+        participants=[SplitMember(user_ref=ref) for ref in parsed.participant_refs],
+    )
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(intent, ctx)
+    assert isinstance(applied, AppliedExpense)
+    return expense_reply(
+        ledger_name=ledger.name,
+        expense_id=applied.expense_id,
+        amount_minor=amount_minor,
+        currency=currency,
+        description=parsed.description,
+        payer_name=applied.payer.display_name,
+        participant_names=[u.display_name for u in applied.participants],
+        rounded_from=parsed.amount if was_rounded else None,
+    )
+
+
+async def _register_author(
+    session: AsyncSession, group_id: int, tg_user: dict[str, Any]
+) -> User | None:
     if tg_user.get("is_bot"):
         # GroupAnonymousBot (anonymous admins), Telegram service accounts: no ghosts (§11)
-        return
-    await register_member(
+        return None
+    return await register_member(
         session,
         group_id,
         platform_user_id=tg_user["id"],

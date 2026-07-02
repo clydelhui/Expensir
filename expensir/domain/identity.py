@@ -4,11 +4,12 @@ Platform-agnostic: callers at the transport-aware edge extract primitives from t
 Telegram update; nothing here imports Telegram shapes.
 """
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from expensir.db.models import Group, GroupMember, Identity, Ledger, User
+from expensir.domain.errors import Rejection
 
 
 async def ensure_group(session: AsyncSession, platform_chat_id: int, title: str | None) -> Group:
@@ -38,6 +39,77 @@ async def ensure_group(session: AsyncSession, platform_chat_id: int, title: str 
         return (
             await session.execute(select(Group).where(Group.platform_chat_id == platform_chat_id))
         ).scalar_one()
+
+
+async def resolve_refs(
+    session: AsyncSession, group_id: int, refs: list[str], actor: User | None
+) -> dict[str, User]:
+    """Resolve refs to REGISTERED members; any unknown rejects the whole intent (§0.9, §11).
+
+    "@username" is exact (case-insensitive); "me" is the interaction's author.
+    """
+    resolved: dict[str, User] = {}
+    unknown: list[str] = []
+    for ref in refs:
+        if ref == "me" and actor is not None:
+            resolved[ref] = actor
+            continue
+        member = await _member_by_username(session, group_id, ref.removeprefix("@"))
+        if member is None:
+            unknown.append(ref)
+        else:
+            resolved[ref] = member
+    if unknown:
+        raise Rejection(
+            f"🚫 I don't know {join_refs(unknown)} yet — nothing was recorded. "
+            "They need to send a message here once, or someone can reply to one of "
+            "their messages with /setup; then try again."
+        )
+    return resolved
+
+
+def join_refs(refs: list[str]) -> str:
+    return ", ".join(ref if ref.startswith("@") else f"@{ref}" for ref in refs)
+
+
+async def _member_by_username(session: AsyncSession, group_id: int, username: str) -> User | None:
+    members = list(
+        (
+            await session.execute(
+                select(User)
+                .join(Identity, Identity.user_id == User.id)
+                .join(GroupMember, GroupMember.user_id == User.id)
+                .where(
+                    Identity.platform == "telegram",
+                    func.lower(Identity.username) == username.lower(),
+                    GroupMember.group_id == group_id,
+                    GroupMember.left_at.is_(None),
+                )
+            )
+        ).scalars()
+    )
+    if len(members) > 1:
+        # Telegram reassigns freed handles and stored usernames can go stale, so two
+        # members may share one; stopgap until the pick-list slice (§10, §13)
+        raise Rejection(
+            f"🤔 More than one member here matches @{username} — I can't tell who you "
+            "mean. Ask them to send a message so I can tell them apart, then try again."
+        )
+    return members[0] if members else None
+
+
+async def registered_members(session: AsyncSession, group_id: int) -> list[User]:
+    """Everyone currently registered here (§11): the meaning of empty participants."""
+    return list(
+        (
+            await session.execute(
+                select(User)
+                .join(GroupMember, GroupMember.user_id == User.id)
+                .where(GroupMember.group_id == group_id, GroupMember.left_at.is_(None))
+                .order_by(User.id)
+            )
+        ).scalars()
+    )
 
 
 async def register_member(

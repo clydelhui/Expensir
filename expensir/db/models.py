@@ -1,8 +1,9 @@
 """SQLAlchemy models (§5). All money is integer minor units (ADR-0008)."""
 
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, String
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Index, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -68,6 +69,67 @@ class Group(Base):
     # App-maintained invariant, not a DB FK: must always point at an OPEN ledger of this
     # group (ADR-0004); a DB-level FK would be circular with ledgers.group_id.
     active_ledger_id: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class Action(Base):
+    """The audit log (§5, §8): every mutation appends exactly one row.
+
+    Row-creating ops are reversed via created_by_action_id on their rows;
+    field/pointer flips store a minimal before_image and restore it on undo.
+    """
+
+    __tablename__ = "actions"
+    __table_args__ = (Index("ix_actions_ledger_undone", "ledger_id", "undone_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ledger_id: Mapped[int] = mapped_column(ForeignKey("ledgers.id"))
+    actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    kind: Mapped[str] = mapped_column(String)
+    intent_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    before_image: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    result_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    result_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    undone_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+
+
+class Expense(Base):
+    __tablename__ = "expenses"
+    __table_args__ = (
+        Index("ix_expenses_ledger_deleted", "ledger_id", "deleted_at"),
+        Index("ix_expenses_created_by_action", "created_by_action_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ledger_id: Mapped[int] = mapped_column(ForeignKey("ledgers.id"))
+    payer_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    amount_minor: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))  # FROZEN at creation (§3)
+    description: Mapped[str] = mapped_column(String)
+    occurred_on: Mapped[str | None] = mapped_column(String)  # ISO date; DISPLAY ONLY (§7.2)
+    split_type: Mapped[str] = mapped_column(String)  # 'equal' | 'exact' | 'shares' | 'percent'
+    source: Mapped[str] = mapped_column(String)  # 'command' | 'nl' | 'ocr'
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_by_action_id: Mapped[int] = mapped_column(ForeignKey("actions.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ExpenseSplit(Base):
+    """Exact minor-unit share per participant; excluded from reads via the expense's deleted_at."""
+
+    __tablename__ = "expense_splits"
+    __table_args__ = (
+        Index("ix_expense_splits_expense_user", "expense_id", "user_id", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    expense_id: Mapped[int] = mapped_column(ForeignKey("expenses.id"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    owed_minor: Mapped[int] = mapped_column(BigInteger)
+    created_by_action_id: Mapped[int] = mapped_column(ForeignKey("actions.id"))
 
 
 class Ledger(Base):

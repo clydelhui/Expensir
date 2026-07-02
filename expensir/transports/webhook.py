@@ -25,12 +25,15 @@ def create_app(deps: Deps, telegram: TelegramClient, webhook_secret: str) -> Fas
             return Response(status_code=200)
         try:
             actions = await dispatch(update, deps)
-            await execute(actions, telegram)
         except Exception:
-            # release the dedupe claim so Telegram's retry of this update_id
-            # is processed rather than swallowed (at-least-once, §13)
+            # nothing committed (dispatch's transaction rolled back): release the
+            # dedupe claim so Telegram's retry is processed, not swallowed (§13)
             await _release_claim(deps, update_id)
             raise
+        # dispatch committed; a send failure must NOT release the claim or the
+        # retry would run the mutation again and double-record money — the retry
+        # no-ops against the kept claim and only the reply is lost
+        await execute(actions, telegram)
         return Response(status_code=200)
 
     return app
