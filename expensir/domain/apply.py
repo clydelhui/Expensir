@@ -29,17 +29,28 @@ class ApplyContext:
 @dataclass
 class AppliedExpense:
     expense_id: int
+    action_id: int  # the one actions row this mutation appended (§0.2)
     payer: User
     participants: list[User]  # the members the split actually used, in stable order
 
 
-async def apply_intent(intent: Intent, ctx: ApplyContext) -> AppliedExpense | None:
+@dataclass
+class AppliedFlip:
+    """A field/pointer flip (§8): reversed by restoring the action's before_image."""
+
+    action_id: int
+
+
+Applied = AppliedExpense | AppliedFlip
+
+
+async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
     await per_group_lock(ctx.session, ctx.group.id)
     await ctx.session.refresh(ctx.group)  # post-lock re-read (ADR-0003)
     if isinstance(intent, AddExpense):
         return await _apply_add_expense(intent, ctx)
     if isinstance(intent, SetHomeCurrency):
-        await _apply_set_home_currency(intent, ctx)
+        return await _apply_set_home_currency(intent, ctx)
     return None
 
 
@@ -84,13 +95,16 @@ async def _apply_add_expense(intent: AddExpense, ctx: ApplyContext) -> AppliedEx
         for user in participants
     )
     await ctx.session.flush()
-    return AppliedExpense(expense_id=expense.id, payer=payer, participants=participants)
+    return AppliedExpense(
+        expense_id=expense.id, action_id=action.id, payer=payer, participants=participants
+    )
 
 
-async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -> None:
+async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -> AppliedFlip:
     before = {"home_currency": ctx.group.home_currency}
     ctx.group.home_currency = intent.currency
-    await _append_action(ctx, intent, before_image=before)
+    action = await _append_action(ctx, intent, before_image=before)
+    return AppliedFlip(action_id=action.id)
 
 
 async def _append_action(

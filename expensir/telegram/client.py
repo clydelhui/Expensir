@@ -8,7 +8,21 @@ JsonDict = dict[str, Any]
 
 
 class TelegramClient(Protocol):
-    async def send_message(self, chat_id: int, text: str) -> JsonDict: ...
+    async def send_message(
+        self, chat_id: int, text: str, reply_markup: JsonDict | None = None
+    ) -> JsonDict: ...
+
+    async def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, reply_markup: JsonDict | None = None
+    ) -> JsonDict: ...
+
+    async def edit_message_reply_markup(
+        self, chat_id: int, message_id: int, reply_markup: JsonDict
+    ) -> JsonDict: ...
+
+    async def answer_callback_query(
+        self, callback_query_id: str, text: str | None = None
+    ) -> JsonDict: ...
 
 
 class PollingTelegramClient(TelegramClient, Protocol):
@@ -25,8 +39,39 @@ class HttpxTelegramClient:
         self._base = f"{api_base}/bot{bot_token}"
         self._http = http or httpx.AsyncClient(timeout=30)
 
-    async def send_message(self, chat_id: int, text: str) -> JsonDict:
-        return cast(JsonDict, await self._call("sendMessage", {"chat_id": chat_id, "text": text}))
+    async def send_message(
+        self, chat_id: int, text: str, reply_markup: JsonDict | None = None
+    ) -> JsonDict:
+        payload: JsonDict = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return cast(JsonDict, await self._call("sendMessage", payload))
+
+    async def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, reply_markup: JsonDict | None = None
+    ) -> JsonDict:
+        payload: JsonDict = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return cast(JsonDict, await self._call("editMessageText", payload))
+
+    async def edit_message_reply_markup(
+        self, chat_id: int, message_id: int, reply_markup: JsonDict
+    ) -> JsonDict:
+        payload: JsonDict = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": reply_markup,
+        }
+        return cast(JsonDict, await self._call("editMessageReplyMarkup", payload))
+
+    async def answer_callback_query(
+        self, callback_query_id: str, text: str | None = None
+    ) -> JsonDict:
+        payload: JsonDict = {"callback_query_id": callback_query_id}
+        if text is not None:
+            payload["text"] = text
+        return cast(JsonDict, await self._call("answerCallbackQuery", payload))
 
     async def get_me(self) -> JsonDict:
         return cast(JsonDict, await self._call("getMe", {}))

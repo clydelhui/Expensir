@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     public_url: str | None = None  # for setWebhook (prod)
     database_url: str
     operator_user_id: int | None = None
+    undo_window_hours: int = 24  # after this, undo/redo is operator-only (§9)
     telegram_api_base: str = "https://api.telegram.org"  # overridable for stub/test servers
 
     @field_validator("public_url", "operator_user_id", mode="before")

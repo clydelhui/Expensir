@@ -50,11 +50,11 @@ class FlakyOnceClient(FakeTelegramClient):
         super().__init__()
         self.failures_left = failures_left
 
-    async def send_message(self, chat_id: int, text: str) -> dict:
+    async def send_message(self, chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
         if self.failures_left:
             self.failures_left -= 1
             raise RuntimeError("telegram is down")
-        return await super().send_message(chat_id, text)
+        return await super().send_message(chat_id, text, reply_markup)
 
 
 async def test_failed_dispatch_releases_the_dedupe_claim_for_telegrams_retry(deps, monkeypatch):

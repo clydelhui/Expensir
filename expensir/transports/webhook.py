@@ -33,7 +33,7 @@ def create_app(deps: Deps, telegram: TelegramClient, webhook_secret: str) -> Fas
         # dispatch committed; a send failure must NOT release the claim or the
         # retry would run the mutation again and double-record money — the retry
         # no-ops against the kept claim and only the reply is lost
-        await execute(actions, telegram)
+        await execute(actions, telegram, session_factory=deps.session_factory)
         return Response(status_code=200)
 
     return app

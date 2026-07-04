@@ -9,7 +9,7 @@ async def poll_once(deps: Deps, client: PollingTelegramClient, offset: int) -> i
     updates = await client.get_updates(offset=offset, timeout=30)
     for update in updates:
         actions = await dispatch(update, deps)
-        await execute(actions, client)
+        await execute(actions, client, session_factory=deps.session_factory)
         offset = max(offset, update["update_id"] + 1)
     return offset
 

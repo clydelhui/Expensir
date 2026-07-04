@@ -45,6 +45,33 @@ def bot_added_update(
     }
 
 
+def callback_update(
+    update_id: int = 3,
+    chat_id: int = -100500,
+    data: str = "v1:undo:1",
+    from_user: dict | None = None,
+    message_id: int = 555,
+    message_text: str | None = "📒 Japan Trip • #1 dinner — EUR 60.00 paid by Alice.",
+    callback_query_id: str = "cbq-1",
+) -> dict:
+    # message_text=None models Telegram's InaccessibleMessage (callback on a very
+    # old message): chat + message_id survive, text does not, and date is 0
+    message = {"message_id": message_id, "chat": group_chat(chat_id), "date": 0}
+    if message_text is not None:
+        message["date"] = 1751400000
+        message["text"] = message_text
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": callback_query_id,
+            "from": from_user or user(),
+            "chat_instance": "ci-1",
+            "data": data,
+            "message": message,
+        },
+    }
+
+
 def message_update(
     update_id: int = 2,
     chat_id: int = -100500,

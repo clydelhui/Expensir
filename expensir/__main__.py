@@ -20,6 +20,8 @@ def main() -> None:
     deps = Deps(
         session_factory=make_session_factory(settings.database_url),
         bot_username=bot_username,
+        operator_user_id=settings.operator_user_id,
+        undo_window_hours=settings.undo_window_hours,
     )
 
     if settings.mode == "poll":
