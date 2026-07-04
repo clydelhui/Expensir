@@ -25,7 +25,15 @@ from expensir.domain.money import to_minor
 from expensir.domain.undo import ToggleDirection, toggle
 from expensir.format.keyboards import redo_keyboard, undo_keyboard
 from expensir.format.render import balance_reply, expense_reply
-from expensir.intents.commands import parse_balance, parse_equal, parse_homecurrency
+from expensir.intents.commands import (
+    ParsedExpense,
+    parse_balance,
+    parse_equal,
+    parse_exact,
+    parse_homecurrency,
+    parse_percent,
+    parse_shares,
+)
 from expensir.intents.schema import AddExpense, SetHomeCurrency, ShowBalance, SplitMember
 
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
@@ -33,7 +41,7 @@ _UNDO_WORDS = re.compile(r"\b(undo|undid|redo)\b", re.IGNORECASE)
 _MENTION = re.compile(r"@\w+")
 UNDONE_MARK = "\n\n↩️ Undone by "
 UNDO_POINTER = (
-    "I never undo from chat — tap the ↩️ Undo button on the message " "that recorded it instead."
+    "I never undo from chat — tap the ↩️ Undo button on the message that recorded it instead."
 )
 
 
@@ -166,11 +174,7 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
             active = await session.get_one(Ledger, group.active_ledger_id)
             text = f"📒 {active.name} • Expensir is ready — try /equal, or /balance."
             return [SendMessage(chat_id=message["chat"]["id"], text=text)]
-        runner = {
-            "homecurrency": _run_homecurrency,
-            "equal": _run_equal,
-            "balance": _run_balance,
-        }.get(command or "")
+        runner = _RUNNERS.get(command or "")
         if runner is not None:
             reply = await _run_command(runner, message, session, group, actor)
             markup = None
@@ -229,10 +233,50 @@ async def _run_homecurrency(
     )
 
 
-async def _run_equal(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+def _expense_runner(parse: Callable[[str], ParsedExpense]) -> CommandRunner:
+    async def run(
+        message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    ) -> Reply:
+        return await _run_expense(message, session, group, actor, parse(message["text"]))
+
+    return run
+
+
+def _split_members(parsed: ParsedExpense, currency: str) -> list[SplitMember]:
+    if parsed.split_type == "exact":
+        # per-person amounts are money: minor-unit conversion needs the resolved currency
+        members = []
+        for ref, value in zip(parsed.participant_refs, parsed.participant_values, strict=True):
+            minor, was_rounded = to_minor(value, currency)
+            if was_rounded:
+                # exact parts are the user's stated amounts: rounding one would either
+                # mis-report the sum check or silently commit altered numbers (§3)
+                raise ValueError(
+                    f"{value} doesn't land on the smallest {currency} unit — "
+                    f"exact amounts can't be finer than that."
+                )
+            members.append(SplitMember(user_ref=ref, exact_minor=minor))
+        return members
+    if parsed.split_type == "shares":
+        return [
+            SplitMember(user_ref=ref, weight=float(value))
+            for ref, value in zip(parsed.participant_refs, parsed.participant_values, strict=True)
+        ]
+    if parsed.split_type == "percent":
+        return [
+            SplitMember(user_ref=ref, percent=float(value))
+            for ref, value in zip(parsed.participant_refs, parsed.participant_values, strict=True)
+        ]
+    return [SplitMember(user_ref=ref) for ref in parsed.participant_refs]
+
+
+async def _run_expense(
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+    parsed: ParsedExpense,
 ) -> Reply:
-    parsed = parse_equal(message["text"])
     # lock before resolving the currency: it depends on the active ledger, which a
     # concurrent /switch could repoint between our read and the write (ADR-0003)
     await per_group_lock(session, group.id)
@@ -246,7 +290,8 @@ async def _run_equal(
         amount_minor=amount_minor,
         currency=currency,
         description=parsed.description,
-        participants=[SplitMember(user_ref=ref) for ref in parsed.participant_refs],
+        split_type=parsed.split_type,
+        participants=_split_members(parsed, currency),
     )
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
     applied = await apply_intent(intent, ctx)
@@ -260,6 +305,8 @@ async def _run_equal(
         payer_name=applied.payer.display_name,
         participant_names=[u.display_name for u in applied.participants],
         rounded_from=parsed.amount if was_rounded else None,
+        split_type=parsed.split_type,
+        shares=[(u.display_name, applied.shares[u.id]) for u in applied.participants],
     )
     return Reply(text=text, undo_action_id=applied.action_id)
 
@@ -279,6 +326,16 @@ async def _run_balance(
     names = await display_names(session, list(net))
     entries = [(names[user_id], by_currency) for user_id, by_currency in net.items()]
     return Reply(text=balance_reply(ledger_name=ledger.name, entries=entries))
+
+
+_RUNNERS: dict[str, CommandRunner] = {
+    "homecurrency": _run_homecurrency,
+    "equal": _expense_runner(parse_equal),
+    "exact": _expense_runner(parse_exact),
+    "shares": _expense_runner(parse_shares),
+    "percent": _expense_runner(parse_percent),
+    "balance": _run_balance,
+}
 
 
 async def _register_author(

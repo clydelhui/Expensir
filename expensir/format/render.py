@@ -2,6 +2,12 @@
 
 from expensir.domain.money import fmt
 
+_SPLIT_LABEL = {
+    "exact": "split exactly",
+    "shares": "split by shares",
+    "percent": "split by percent",
+}
+
 
 def expense_reply(
     *,
@@ -13,14 +19,19 @@ def expense_reply(
     payer_name: str,
     participant_names: list[str],
     rounded_from: str | None = None,
+    split_type: str = "equal",
+    shares: list[tuple[str, int]] | None = None,  # (name, owed minor), non-equal splits
 ) -> str:
     amount = fmt(amount_minor, currency)
     rounded = f" (rounded from {rounded_from})" if rounded_from is not None else ""
-    split = (
-        f"owed entirely by {participant_names[0]}"
-        if len(participant_names) == 1
-        else f"split equally between {join_names(participant_names)}"
-    )
+    if len(participant_names) == 1:
+        split = f"owed entirely by {participant_names[0]}"
+    elif split_type == "equal":
+        split = f"split equally between {join_names(participant_names)}"
+    else:
+        assert shares is not None
+        each = ", ".join(f"{name} {fmt(minor, currency)}" for name, minor in shares)
+        split = f"{_SPLIT_LABEL[split_type]}: {each}"
     return (
         f"📒 {ledger_name} • #{expense_id} {description} — {amount}{rounded} "
         f"paid by {payer_name}, {split}."

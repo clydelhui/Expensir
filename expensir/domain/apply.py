@@ -14,6 +14,7 @@ from expensir.db.models import Action, Expense, ExpenseSplit, Group, User
 from expensir.domain.allocate import allocate
 from expensir.domain.errors import Rejection
 from expensir.domain.identity import registered_members, resolve_refs
+from expensir.domain.money import fmt
 from expensir.intents.schema import AddExpense, Intent, SetHomeCurrency
 
 
@@ -32,6 +33,7 @@ class AppliedExpense:
     action_id: int  # the one actions row this mutation appended (§0.2)
     payer: User
     participants: list[User]  # the members the split actually used, in stable order
+    shares: dict[int, int]  # user id -> owed minor units, as committed
 
 
 @dataclass
@@ -67,7 +69,7 @@ async def _apply_add_expense(intent: AddExpense, ctx: ApplyContext) -> AppliedEx
     if not participants:
         participants = await registered_members(ctx.session, ctx.group.id)
 
-    shares = allocate(intent.amount_minor, {u.id: 1 for u in participants}, ctx.seed)
+    shares = _split(intent, resolved, participants, ctx.seed)
 
     action = await _append_action(ctx, intent)
     assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
@@ -96,8 +98,59 @@ async def _apply_add_expense(intent: AddExpense, ctx: ApplyContext) -> AppliedEx
     )
     await ctx.session.flush()
     return AppliedExpense(
-        expense_id=expense.id, action_id=action.id, payer=payer, participants=participants
+        expense_id=expense.id,
+        action_id=action.id,
+        payer=payer,
+        participants=participants,
+        shares=shares,
     )
+
+
+def _split(
+    intent: AddExpense, resolved: dict[str, User], participants: list[User], seed: int
+) -> dict[int, int]:
+    """Per-user minor-unit shares — validation by split type BEFORE allocate (§7.1)."""
+    currency = intent.currency or ""
+    if intent.split_type == "exact":
+        shares = {u: int(v) for u, v in _per_user(intent, resolved, "exact_minor").items()}
+        stated = sum(shares.values())
+        if stated != intent.amount_minor:
+            gap = fmt(abs(intent.amount_minor - stated), currency)
+            direction = "short of" if stated < intent.amount_minor else "over"
+            raise Rejection(
+                f"Those parts add up to {fmt(stated, currency)} — "
+                f"{gap} {direction} the {fmt(intent.amount_minor, currency)} total."
+            )
+        return shares
+    if intent.split_type == "shares":
+        return allocate(intent.amount_minor, _per_user(intent, resolved, "weight"), seed)
+    if intent.split_type == "percent":
+        percents = _per_user(intent, resolved, "percent")
+        total_percent = sum(percents.values())
+        if abs(total_percent - 100) > 1.0:
+            raise Rejection(
+                f"Those percents add up to {total_percent:g}, not 100 — "
+                "they need to land within ±1 of 100."
+            )
+        # weights = the given percents; normalization absorbs the ±1.0 tolerance (§7.1)
+        return allocate(intent.amount_minor, percents, seed)
+    return allocate(intent.amount_minor, {u.id: 1 for u in participants}, seed)
+
+
+def _per_user(intent: AddExpense, resolved: dict[str, User], attr: str) -> dict[int, int | float]:
+    """Each participant's stated value keyed by resolved user id, one value per person."""
+    values: dict[int, int | float] = {}
+    for member in intent.participants:
+        value = getattr(member, attr)
+        assert value is not None  # the parser/extractor set the field this split type needs
+        user_id = resolved[member.user_ref].id
+        if user_id in values:
+            # distinct refs can land on one person (e.g. "me" and "@alice"); never guess
+            raise Rejection(
+                f"{member.user_ref} appears more than once in the split — name each person once."
+            )
+        values[user_id] = value
+    return values
 
 
 async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -> AppliedFlip:
