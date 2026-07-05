@@ -134,9 +134,8 @@ class ExpenseSplit(Base):
 
 class Ledger(Base):
     __tablename__ = "ledgers"
-    # create-board-once guard (ADR-0003). Composite because Telegram message ids are
-    # only unique per chat — a global UNIQUE(board_message_id) as written in §5 would
-    # collide across groups (spec deviation filed as a follow-up issue).
+    # create-board-once guard (ADR-0003, §5). Composite because Telegram message ids are
+    # only unique per chat — a global UNIQUE(board_message_id) would collide across groups.
     __table_args__ = (
         Index("ix_ledgers_board_chat_message", "board_chat_id", "board_message_id", unique=True),
     )

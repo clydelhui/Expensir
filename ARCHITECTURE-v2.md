@@ -372,7 +372,9 @@ group_members    (group_id, user_id, joined_at, left_at)
 ledgers          (id, group_id, name, status['open'|'archived'], logging_currency,
                   created_at, archived_at, board_message_id, board_chat_id)
                    -- logging_currency NULLABLE -> resolves to home at read time (ADR-0001)
-                   -- board_message_id UNIQUE (create-board-once guard, ADR-0003)
+                   -- UNIQUE(board_chat_id, board_message_id) = create-board-once guard (ADR-0003).
+                   --   Composite, not single-column: Telegram message_ids are unique only
+                   --   per chat and start small, so two groups' boards routinely share one.
 
 expenses         (id, ledger_id, payer_id, amount_minor, currency, description, occurred_on,
                   split_type, source['command'|'nl'|'ocr'], created_by_user_id,
@@ -404,7 +406,8 @@ processed_updates(update_id PK, seen_at)                 -- webhook idempotency
 Indices: `expenses(ledger_id, deleted_at)`, `settlements(ledger_id, deleted_at, created_at)`,
 `actions(ledger_id, undone_at)`, `identities(platform, username)`,
 `identities(platform, platform_user_id)`, `expenses(created_by_action_id)`,
-`settlements(created_by_action_id)`. Unique: `ledgers(board_message_id)`.
+`settlements(created_by_action_id)`. Unique: `ledgers(board_chat_id, board_message_id)`
+(composite — Telegram message_ids are unique only per chat).
 
 Rules:
 - `groups.active_ledger_id` must always point to an **open** ledger of that group. Operations that
@@ -774,7 +777,7 @@ returns a refined intent for the reply-to-correct loop.
 - **Entities:** parse `mention` (text only — may be unresolvable → reject) and `text_mention`
   (embeds `user.id` — resolvable/registerable).
 - **Board lifecycle (ADR-0003, ADR-0006):** created+pinned on a ledger's first mutation (or on
-  `/newledger`), guarded by the per-group lock + the `board_message_id` unique constraint so only one
+  `/newledger`), guarded by the per-group lock + the `(board_chat_id, board_message_id)` unique constraint so only one
   board is ever created. Thereafter rendered from post-write balances **inside** the locked
   transaction and edited in place (content consistent even under concurrent writes; the API call is
   best-effort). Each debt line: `from → to  AMT CCY (≈ home)  [Settle]`. `[Settle]` is WYSIWYG
@@ -819,7 +822,7 @@ Deploy: run Alembic migrations + `setWebhook` as a one-shot release step, not on
 1. **Skeleton + transport + outbound.** `webhook.py` + `poll.py` both call `dispatch`; `executor.py`
    performs `OutboundAction`s. *Done when:* `/start` echoes via webhook (secret checked) and polling.
 2. **DB + models + Alembic.** All tables from §5 incl. `groups.home_currency`,
-   `ledgers.logging_currency`, unique `board_message_id`. *Done when:* migrations apply clean on
+   `ledgers.logging_currency`, unique `(board_chat_id, board_message_id)`. *Done when:* migrations apply clean on
    Postgres and SQLite; `/start` registers group + caller + first ledger.
 3. **Money & currency (pure).** `money.py` (`to_minor`, `fmt`, minor-digits table) +
    `currency.py` resolution order (§3). *Done when:* unit tests cover 2/0/3-decimal currencies,
