@@ -6,6 +6,7 @@ which the core looks up (ledger logging -> group home, §3) before building the 
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Literal
 
 EQUAL_USAGE = "Usage: /equal <amount> [ISO] <description> [@name ...]"
@@ -14,6 +15,14 @@ SHARES_USAGE = "Usage: /shares <amount> [ISO] <description> @name=<weight> ... (
 PERCENT_USAGE = "Usage: /percent <amount> [ISO] <description> @name=<percent> ..."
 HOMECURRENCY_USAGE = "Usage: /homecurrency <ISO>, e.g. /homecurrency USD"
 BALANCE_USAGE = "Usage: /balance — everyone's position, or /balance me for yours"
+DELETE_USAGE = "Usage: reply to the expense with /delete, or /delete <id> (the #id on its line)"
+EDIT_USAGE = (
+    "Usage: reply to the expense with /edit, or /edit <id> — then [YYYY-MM-DD] "
+    "[new description]. Amounts and participants can't be edited; delete and re-add instead."
+)
+
+_EXPENSE_ID = re.compile(r"^#?(\d+)$")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _AMOUNT = re.compile(r"^\d+(\.\d+)?$")
 _UPPER_ISO = re.compile(r"^[A-Z]{3}$")
@@ -125,6 +134,53 @@ def parse_balance(text: str) -> Literal["me", "group"]:
     if tokens == ["me"]:
         return "me"
     raise ValueError(BALANCE_USAGE)
+
+
+def parse_delete(text: str) -> int | None:
+    """The explicit '#id' if given (§11); None means 'resolve from the reply target'."""
+    tokens = text.split()[1:]
+    if not tokens:
+        return None
+    match = _EXPENSE_ID.match(tokens[0]) if len(tokens) == 1 else None
+    if match is None:
+        raise ValueError(DELETE_USAGE)
+    return int(match.group(1))
+
+
+@dataclass
+class ParsedEdit:
+    """Non-financial fields only (§4): a #id (optional when replying), a date, a description."""
+
+    expense_id: int | None
+    description: str | None
+    occurred_on: str | None  # ISO date; DISPLAY ONLY (§7.2)
+
+
+def parse_edit(text: str) -> ParsedEdit:
+    tokens = text.split()[1:]
+
+    expense_id = None
+    if tokens:
+        match = _EXPENSE_ID.match(tokens[0])
+        if match is not None:
+            expense_id = int(match.group(1))
+            tokens = tokens[1:]
+
+    occurred_on = None
+    # a date is recognized only as the FIRST token after the id, so descriptions
+    # that merely mention a date ("dinner on 2026-07-01") stay intact
+    if tokens and _ISO_DATE.match(tokens[0]):
+        try:
+            date.fromisoformat(tokens[0])
+        except ValueError:
+            raise ValueError(f"{tokens[0]} isn't a real date — use YYYY-MM-DD.") from None
+        occurred_on = tokens[0]
+        tokens = tokens[1:]
+
+    description = " ".join(tokens) or None
+    if description is None and occurred_on is None:
+        raise ValueError(EDIT_USAGE)
+    return ParsedEdit(expense_id=expense_id, description=description, occurred_on=occurred_on)
 
 
 def parse_homecurrency(text: str) -> str:

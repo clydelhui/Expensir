@@ -16,25 +16,46 @@ from expensir.core.outbound import (
     SendMessage,
 )
 from expensir.db.models import Group, Ledger, User
-from expensir.domain.apply import AppliedExpense, ApplyContext, apply_intent
+from expensir.domain.apply import (
+    AppliedExpense,
+    AppliedExpenseChange,
+    ApplyContext,
+    apply_intent,
+)
 from expensir.domain.balances import net_positions
 from expensir.domain.currency import resolve_currency
 from expensir.domain.errors import Rejection
-from expensir.domain.identity import display_names, ensure_group, register_member
+from expensir.domain.identity import (
+    display_names,
+    ensure_group,
+    register_member,
+    resolve_expense_id,
+)
 from expensir.domain.money import to_minor
 from expensir.domain.undo import ToggleDirection, toggle
 from expensir.format.keyboards import redo_keyboard, undo_keyboard
-from expensir.format.render import balance_reply, expense_reply
+from expensir.format.render import balance_reply, delete_reply, edit_reply, expense_reply
 from expensir.intents.commands import (
+    DELETE_USAGE,
+    EDIT_USAGE,
     ParsedExpense,
     parse_balance,
+    parse_delete,
+    parse_edit,
     parse_equal,
     parse_exact,
     parse_homecurrency,
     parse_percent,
     parse_shares,
 )
-from expensir.intents.schema import AddExpense, SetHomeCurrency, ShowBalance, SplitMember
+from expensir.intents.schema import (
+    AddExpense,
+    DeleteExpense,
+    EditExpense,
+    SetHomeCurrency,
+    ShowBalance,
+    SplitMember,
+)
 
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
 _UNDO_WORDS = re.compile(r"\b(undo|undid|redo)\b", re.IGNORECASE)
@@ -311,6 +332,76 @@ async def _run_expense(
     return Reply(text=text, undo_action_id=applied.action_id)
 
 
+async def _run_delete(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    explicit_id = parse_delete(message["text"])
+    expense_id = await _referenced_expense_id(message, session, group, explicit_id, DELETE_USAGE)
+
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(DeleteExpense(expense_id=expense_id), ctx)
+    assert isinstance(applied, AppliedExpenseChange)
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    text = delete_reply(
+        ledger_name=ledger.name,
+        expense_id=applied.expense.id,
+        amount_minor=applied.expense.amount_minor,
+        currency=applied.expense.currency,
+        description=applied.expense.description,
+    )
+    return Reply(text=text, undo_action_id=applied.action_id)
+
+
+async def _run_edit(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    parsed = parse_edit(message["text"])
+    expense_id = await _referenced_expense_id(
+        message, session, group, parsed.expense_id, EDIT_USAGE
+    )
+
+    intent = EditExpense(
+        expense_id=expense_id, description=parsed.description, occurred_on=parsed.occurred_on
+    )
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(intent, ctx)
+    assert isinstance(applied, AppliedExpenseChange)
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    text = edit_reply(
+        ledger_name=ledger.name,
+        expense_id=applied.expense.id,
+        amount_minor=applied.expense.amount_minor,
+        currency=applied.expense.currency,
+        description=applied.expense.description,
+        occurred_on=applied.expense.occurred_on,
+    )
+    return Reply(text=text, undo_action_id=applied.action_id)
+
+
+async def _referenced_expense_id(
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    explicit_id: int | None,
+    usage: str,
+) -> int:
+    """Resolve the expense a delete/edit refers to (§11): reply primary, #id fallback."""
+    # lock before resolving the reference: resolution + seal check + write must
+    # see one consistent active ledger (ADR-0003)
+    await per_group_lock(session, group.id)
+    await session.refresh(group)
+    reply_to = message.get("reply_to_message")
+    expense_id = await resolve_expense_id(
+        session,
+        platform_chat_id=message["chat"]["id"],
+        reply_message_id=reply_to["message_id"] if reply_to is not None else None,
+        explicit_id=explicit_id,
+    )
+    if expense_id is None:
+        raise ValueError(usage)
+    return expense_id
+
+
 async def _run_balance(
     message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
 ) -> Reply:
@@ -335,6 +426,8 @@ _RUNNERS: dict[str, CommandRunner] = {
     "shares": _expense_runner(parse_shares),
     "percent": _expense_runner(parse_percent),
     "balance": _run_balance,
+    "delete": _run_delete,
+    "edit": _run_edit,
 }
 
 

@@ -79,14 +79,21 @@ def message_update(
     text: str = "/start",
     from_user: dict | None = None,
     message_id: int = 10,
+    reply_to_message_id: int | None = None,
+    reply_to_from: dict | None = None,
 ) -> dict:
-    return {
-        "update_id": update_id,
-        "message": {
-            "message_id": message_id,
-            "chat": group_chat(chat_id, title),
-            "from": from_user or user(),
-            "date": 1751400000,
-            "text": text,
-        },
+    message = {
+        "message_id": message_id,
+        "chat": group_chat(chat_id, title),
+        "from": from_user or user(),
+        "date": 1751400000,
+        "text": text,
     }
+    if reply_to_message_id is not None:
+        message["reply_to_message"] = {
+            "message_id": reply_to_message_id,
+            "chat": group_chat(chat_id, title),
+            "from": reply_to_from or BOT_USER,
+            "date": 1751400000,
+        }
+    return {"update_id": update_id, "message": message}

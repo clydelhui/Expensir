@@ -18,7 +18,7 @@ from expensir.db.models import Action, Expense, Group, Identity, Ledger, User, u
 ToggleDirection = Literal["undo", "redo"]
 
 # grows as slices add undoable kinds (§4); setup is permanent and never listed
-REVERSIBLE_KINDS = {"add_expense", "set_home_currency"}
+REVERSIBLE_KINDS = {"add_expense", "delete_expense", "edit_expense", "set_home_currency"}
 
 
 @dataclass
@@ -90,6 +90,25 @@ async def _reverse(session: AsyncSession, action: Action, group: Group, now: dat
         await session.execute(
             update(Expense).where(Expense.created_by_action_id == action.id).values(deleted_at=now)
         )
+    elif action.kind == "delete_expense":
+        expense = await _target_expense(session, action)
+        if await _expense_should_be_visible(session, expense, excluding_action_id=action.id):
+            expense.deleted_at = None
+    elif action.kind == "edit_expense":
+        before = action.before_image
+        assert before is not None
+        expense = await _target_expense(session, action)
+        # the before_image is MINIMAL (§8): restore only the fields this edit
+        # changed, so a later standing edit's untouched fields survive
+        if "description" in before:
+            expense.description = before["description"]
+        if "occurred_on" in before:
+            expense.occurred_on = before["occurred_on"]
+        # edited_at is derived, not restored: the newest OTHER standing edit keeps
+        # the expense marked edited; none -> back to never-edited
+        expense.edited_at = await _latest_standing_edit_at(
+            session, expense.id, excluding_action_id=action.id
+        )
     elif action.kind == "set_home_currency":
         assert action.before_image is not None
         group.home_currency = action.before_image["home_currency"]
@@ -98,11 +117,86 @@ async def _reverse(session: AsyncSession, action: Action, group: Group, now: dat
 async def _reapply(session: AsyncSession, action: Action, group: Group) -> None:
     """Redo: restore the rows the action created, or re-apply its field flip (§9)."""
     if action.kind == "add_expense":
-        await session.execute(
-            update(Expense).where(Expense.created_by_action_id == action.id).values(deleted_at=None)
+        expenses = (
+            (
+                await session.execute(
+                    select(Expense).where(Expense.created_by_action_id == action.id)
+                )
+            )
+            .scalars()
+            .all()
         )
+        for expense in expenses:
+            # an explicit /delete outlives the add's undo/redo cycle: redo must
+            # never resurrect an expense a standing delete action removed (§8)
+            if not await _active_delete_exists(session, expense.id):
+                expense.deleted_at = None
+    elif action.kind == "delete_expense":
+        expense = await _target_expense(session, action)
+        if expense.deleted_at is None:
+            expense.deleted_at = utcnow()
+    elif action.kind == "edit_expense":
+        expense = await _target_expense(session, action)
+        if action.intent_json["description"] is not None:
+            expense.description = action.intent_json["description"]
+        if action.intent_json["occurred_on"] is not None:
+            expense.occurred_on = action.intent_json["occurred_on"]
+        # derived like _reverse: this action stands again, so count it in
+        others = await _latest_standing_edit_at(session, expense.id, excluding_action_id=action.id)
+        expense.edited_at = max(filter(None, (others, action.created_at)))
     elif action.kind == "set_home_currency":
         group.home_currency = action.intent_json["currency"]
+
+
+async def _target_expense(session: AsyncSession, action: Action) -> Expense:
+    """The one expense a delete/edit action concerns, from its recorded intent (§8)."""
+    expense_id = action.intent_json["expense_id"]
+    assert isinstance(expense_id, int)
+    return await session.get_one(Expense, expense_id)
+
+
+async def _expense_should_be_visible(
+    session: AsyncSession, expense: Expense, excluding_action_id: int
+) -> bool:
+    """Visibility is derived, never assumed (§0.4): restoring one action's effect
+    must not override the others — the add must stand and no other delete may."""
+    add_action = await session.get_one(Action, expense.created_by_action_id)
+    if add_action.undone_at is not None:
+        return False
+    return not await _active_delete_exists(session, expense.id, excluding_action_id)
+
+
+async def _latest_standing_edit_at(
+    session: AsyncSession, expense_id: int, excluding_action_id: int
+) -> datetime | None:
+    """When the newest not-undone edit on this expense happened; None -> never edited."""
+    return (
+        await session.execute(
+            select(Action.created_at)
+            .where(
+                Action.kind == "edit_expense",
+                Action.undone_at.is_(None),
+                Action.id != excluding_action_id,
+                Action.intent_json["expense_id"].as_integer() == expense_id,
+            )
+            .order_by(Action.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _active_delete_exists(
+    session: AsyncSession, expense_id: int, excluding_action_id: int | None = None
+) -> bool:
+    """Is a not-undone delete_expense action standing against this expense?"""
+    stmt = select(Action.id).where(
+        Action.kind == "delete_expense",
+        Action.undone_at.is_(None),
+        Action.intent_json["expense_id"].as_integer() == expense_id,
+    )
+    if excluding_action_id is not None:
+        stmt = stmt.where(Action.id != excluding_action_id)
+    return (await session.execute(stmt.limit(1))).scalar_one_or_none() is not None
 
 
 async def _operator_name(session: AsyncSession, operator_platform_id: int | None) -> str:

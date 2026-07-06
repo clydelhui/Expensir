@@ -10,12 +10,18 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from expensir.core.locking import per_group_lock
-from expensir.db.models import Action, Expense, ExpenseSplit, Group, User
+from expensir.db.models import Action, Expense, ExpenseSplit, Group, Ledger, User, utcnow
 from expensir.domain.allocate import allocate
 from expensir.domain.errors import Rejection
 from expensir.domain.identity import registered_members, resolve_refs
 from expensir.domain.money import fmt
-from expensir.intents.schema import AddExpense, Intent, SetHomeCurrency
+from expensir.intents.schema import (
+    AddExpense,
+    DeleteExpense,
+    EditExpense,
+    Intent,
+    SetHomeCurrency,
+)
 
 
 @dataclass
@@ -43,7 +49,15 @@ class AppliedFlip:
     action_id: int
 
 
-Applied = AppliedExpense | AppliedFlip
+@dataclass
+class AppliedExpenseChange:
+    """delete_expense / edit_expense: the acted-on expense, for the caller's render (§8)."""
+
+    action_id: int
+    expense: Expense
+
+
+Applied = AppliedExpense | AppliedFlip | AppliedExpenseChange
 
 
 async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
@@ -51,6 +65,10 @@ async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
     await ctx.session.refresh(ctx.group)  # post-lock re-read (ADR-0003)
     if isinstance(intent, AddExpense):
         return await _apply_add_expense(intent, ctx)
+    if isinstance(intent, DeleteExpense):
+        return await _apply_delete_expense(intent, ctx)
+    if isinstance(intent, EditExpense):
+        return await _apply_edit_expense(intent, ctx)
     if isinstance(intent, SetHomeCurrency):
         return await _apply_set_home_currency(intent, ctx)
     return None
@@ -151,6 +169,66 @@ def _per_user(intent: AddExpense, resolved: dict[str, User], attr: str) -> dict[
             )
         values[user_id] = value
     return values
+
+
+async def _apply_delete_expense(intent: DeleteExpense, ctx: ApplyContext) -> AppliedExpenseChange:
+    _require_actor(ctx)
+    expense = await _sealed_expense(intent.expense_id, ctx)
+    if expense.deleted_at is not None:
+        raise Rejection(f"🤷 #{expense.id} is already gone — nothing to delete.")
+    action = await _append_action(ctx, intent)
+    expense.deleted_at = utcnow()
+    await ctx.session.flush()
+    return AppliedExpenseChange(action_id=action.id, expense=expense)
+
+
+async def _apply_edit_expense(intent: EditExpense, ctx: ApplyContext) -> AppliedExpenseChange:
+    """Non-financial fields only (§4, §8): display changes, never a balance change (§0.4)."""
+    _require_actor(ctx)
+    expense = await _sealed_expense(intent.expense_id, ctx)
+    if expense.deleted_at is not None:
+        raise Rejection(
+            f"🚫 #{expense.id} is deleted — tap ↩️ Undo on its delete first if you want it back."
+        )
+    if intent.description is None and intent.occurred_on is None:
+        raise Rejection("Nothing to change — give a new description and/or a YYYY-MM-DD date.")
+
+    # MINIMAL before_image (§8): only the fields this edit changes — undoing this
+    # edit later must not clobber another standing edit's untouched fields.
+    # edited_at is not captured: it is derived from the standing edit actions on undo/redo.
+    before: dict[str, Any] = {"expense_id": expense.id}
+    if intent.description is not None:
+        before["description"] = expense.description
+    if intent.occurred_on is not None:
+        before["occurred_on"] = expense.occurred_on
+    action = await _append_action(ctx, intent, before_image=before)
+    if intent.description is not None:
+        expense.description = intent.description
+    if intent.occurred_on is not None:
+        expense.occurred_on = intent.occurred_on
+    expense.edited_at = utcnow()
+    await ctx.session.flush()
+    return AppliedExpenseChange(action_id=action.id, expense=expense)
+
+
+async def _sealed_expense(expense_id: int, ctx: ApplyContext) -> Expense:
+    """Load an expense reference, enforcing the ledger seal (§0.10, §11).
+
+    Another group's expense reads as not-found — the bot stays silent about
+    other groups; another ledger of THIS group is refused with a pointer to switch.
+    """
+    not_found = Rejection(f"🚫 I can't find expense #{expense_id} here — check the #id.")
+    expense = await ctx.session.get(Expense, expense_id)
+    if expense is None:
+        raise not_found
+    ledger = await ctx.session.get_one(Ledger, expense.ledger_id)
+    if ledger.group_id != ctx.group.id:
+        raise not_found
+    if expense.ledger_id != ctx.group.active_ledger_id:
+        raise Rejection(
+            f"🔒 #{expense_id} is in 📒 {ledger.name} — switch there first, then try again."
+        )
+    return expense
 
 
 async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -> AppliedFlip:

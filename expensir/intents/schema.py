@@ -24,6 +24,22 @@ class AddExpense(BaseModel):
     confidence: float | None = None  # LLM self-report; COSMETIC ONLY (§0.7)
 
 
+class DeleteExpense(BaseModel):
+    """Soft-delete: flips deleted_at, undoable — 'fixing history' (§4, §8)."""
+
+    kind: Literal["delete_expense"] = "delete_expense"
+    expense_id: int  # resolved via reply-to-target / #id (§11)
+
+
+class EditExpense(BaseModel):
+    """Non-financial fields ONLY (§4): display never reorders balances (§0.4)."""
+
+    kind: Literal["edit_expense"] = "edit_expense"
+    expense_id: int
+    description: str | None = None
+    occurred_on: str | None = None  # ISO date; DISPLAY ONLY (§7.2)
+
+
 class SetHomeCurrency(BaseModel):
     kind: Literal["set_home_currency"] = "set_home_currency"
     currency: str
@@ -39,6 +55,6 @@ class ShowBalance(BaseModel):
 
 # grows into the full §4 discriminated union as slices add kinds
 Intent = Annotated[
-    AddExpense | SetHomeCurrency | ShowBalance,
+    AddExpense | DeleteExpense | EditExpense | SetHomeCurrency | ShowBalance,
     Field(discriminator="kind"),
 ]

@@ -38,6 +38,32 @@ def expense_reply(
     )
 
 
+def delete_reply(
+    *,
+    ledger_name: str,
+    expense_id: int,
+    amount_minor: int,
+    currency: str,
+    description: str,
+) -> str:
+    amount = fmt(amount_minor, currency)
+    return f"📒 {ledger_name} • 🗑 Deleted #{expense_id} {description} — {amount}. Balances updated."
+
+
+def edit_reply(
+    *,
+    ledger_name: str,
+    expense_id: int,
+    amount_minor: int,
+    currency: str,
+    description: str,
+    occurred_on: str | None,
+) -> str:
+    amount = fmt(amount_minor, currency)
+    dated = f", dated {occurred_on}" if occurred_on is not None else ""
+    return f"📒 {ledger_name} • ✏️ #{expense_id} is now: {description} — {amount}{dated}."
+
+
 def join_names(names: list[str]) -> str:
     if len(names) <= 1:
         return "".join(names)

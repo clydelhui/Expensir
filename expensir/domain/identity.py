@@ -8,7 +8,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from expensir.db.models import Group, GroupMember, Identity, Ledger, User
+from expensir.db.models import Action, Expense, Group, GroupMember, Identity, Ledger, User
 from expensir.domain.errors import Rejection
 
 
@@ -96,6 +96,60 @@ async def _member_by_username(session: AsyncSession, group_id: int, username: st
             "mean. Ask them to send a message so I can tell them apart, then try again."
         )
     return members[0] if members else None
+
+
+async def resolve_expense_id(
+    session: AsyncSession,
+    platform_chat_id: int,
+    reply_message_id: int | None,
+    explicit_id: int | None,
+) -> int | None:
+    """Expense reference resolution (§11): reply-to-target primary, visible #id fallback.
+
+    A reply to a bot result message resolves via the action's stored result
+    message id. When both are given they must agree — deleting or editing the
+    wrong expense is worse than asking again. None means nothing resolved.
+    """
+    replied = None
+    if reply_message_id is not None:
+        replied = await _expense_id_of_result_message(session, platform_chat_id, reply_message_id)
+    if replied is not None and explicit_id is not None and replied != explicit_id:
+        raise Rejection(
+            f"🤔 That reply points at #{replied} but you wrote #{explicit_id} — "
+            "I can't tell which you mean, so nothing was changed."
+        )
+    return replied if replied is not None else explicit_id
+
+
+async def _expense_id_of_result_message(
+    session: AsyncSession, platform_chat_id: int, message_id: int
+) -> int | None:
+    """Map a bot result message back to the expense it concerns (§11).
+
+    add_expense results map via created_by_action_id; delete/edit results carry
+    the expense id in their intent — replying to those keeps working too.
+    """
+    action = (
+        await session.execute(
+            select(Action).where(
+                Action.result_chat_id == platform_chat_id,
+                Action.result_message_id == message_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if action is None:
+        return None
+    if action.kind == "add_expense":
+        return (
+            await session.execute(
+                select(Expense.id).where(Expense.created_by_action_id == action.id)
+            )
+        ).scalar_one_or_none()
+    if action.kind in ("delete_expense", "edit_expense"):
+        expense_id = action.intent_json["expense_id"]
+        assert isinstance(expense_id, int)
+        return expense_id
+    return None
 
 
 async def display_names(session: AsyncSession, user_ids: list[int]) -> dict[int, str]:
