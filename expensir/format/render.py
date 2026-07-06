@@ -1,6 +1,29 @@
 """Reply formatting (§6): results carry the active-ledger prefix and a visible #id."""
 
+from dataclasses import dataclass
+
 from expensir.domain.money import fmt
+
+
+@dataclass(frozen=True)
+class LedgerLine:
+    ledger_id: int  # shown as #id: names may repeat, /switch #id always lands (§11's spirit)
+    name: str
+    is_active: bool
+    is_archived: bool
+    logging_currency: str | None
+
+
+def ledgers_reply(lines: list[LedgerLine]) -> str:
+    """The /ledgers read (§0.7): the whole list, active marked, archived labeled."""
+    rendered = []
+    for line in lines:
+        marks = [m for m in ("active" if line.is_active else "", line.logging_currency or "") if m]
+        suffix = f" ({', '.join(marks)})" if marks else ""
+        status = " — archived" if line.is_archived else ""
+        rendered.append(f"• 📒 #{line.ledger_id} {line.name}{suffix}{status}")
+    return "Ledgers\n" + "\n".join(rendered)
+
 
 _SPLIT_LABEL = {
     "exact": "split exactly",

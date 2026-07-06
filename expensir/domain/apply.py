@@ -5,17 +5,29 @@ so a concurrent /switch or currency change can never interleave with this write.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from expensir.core.locking import per_group_lock
-from expensir.db.models import Action, Expense, ExpenseSplit, Group, User
+from expensir.db.models import Action, Expense, ExpenseSplit, Group, Ledger, User, utcnow
 from expensir.domain.allocate import allocate
+from expensir.domain.balances import net_positions
 from expensir.domain.errors import Rejection
 from expensir.domain.identity import registered_members, resolve_refs
+from expensir.domain.ledgers import find_ledger, most_recent_open
 from expensir.domain.money import fmt
-from expensir.intents.schema import AddExpense, Intent, SetHomeCurrency
+from expensir.intents.schema import (
+    AddExpense,
+    ArchiveLedger,
+    Intent,
+    NewLedger,
+    SetHomeCurrency,
+    SetLoggingCurrency,
+    SwitchLedger,
+    UnarchiveLedger,
+)
 
 
 @dataclass
@@ -43,7 +55,17 @@ class AppliedFlip:
     action_id: int
 
 
-Applied = AppliedExpense | AppliedFlip
+@dataclass
+class AppliedLedgerOp:
+    """A ledger lifecycle flip (§8, ADR-0004): the caller renders the announcement."""
+
+    action_id: int
+    ledger: Ledger
+    repointed_to: Ledger | None = None  # archiving the active ledger repoints deterministically
+    outstanding_balances: bool = False  # archive warns but proceeds (§17)
+
+
+Applied = AppliedExpense | AppliedFlip | AppliedLedgerOp
 
 
 async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
@@ -53,6 +75,16 @@ async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
         return await _apply_add_expense(intent, ctx)
     if isinstance(intent, SetHomeCurrency):
         return await _apply_set_home_currency(intent, ctx)
+    if isinstance(intent, SetLoggingCurrency):
+        return await _apply_set_logging_currency(intent, ctx)
+    if isinstance(intent, NewLedger):
+        return await _apply_new_ledger(intent, ctx)
+    if isinstance(intent, SwitchLedger):
+        return await _apply_switch_ledger(intent, ctx)
+    if isinstance(intent, ArchiveLedger):
+        return await _apply_archive_ledger(intent, ctx)
+    if isinstance(intent, UnarchiveLedger):
+        return await _apply_unarchive_ledger(intent, ctx)
     return None
 
 
@@ -160,13 +192,109 @@ async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -
     return AppliedFlip(action_id=action.id)
 
 
+async def _apply_set_logging_currency(
+    intent: SetLoggingCurrency, ctx: ApplyContext
+) -> AppliedLedgerOp:
+    """Change the ACTIVE ledger's new-expense default (ADR-0001); existing expenses keep
+    their frozen currency — this is a default-picker, never a re-denomination (§3)."""
+    assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+    ledger = await ctx.session.get_one(Ledger, ctx.group.active_ledger_id)
+    before = {"logging_currency": ledger.logging_currency}
+    ledger.logging_currency = intent.currency
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=ledger.id)
+    return AppliedLedgerOp(action_id=action.id, ledger=ledger)
+
+
+async def _apply_new_ledger(intent: NewLedger, ctx: ApplyContext) -> AppliedLedgerOp:
+    """Create + activate (§8, ADR-0004): undo restores the previous active pointer."""
+    before = {"active_ledger_id": ctx.group.active_ledger_id}
+    ledger = Ledger(
+        group_id=ctx.group.id, name=intent.name, logging_currency=intent.logging_currency
+    )
+    ctx.session.add(ledger)
+    await ctx.session.flush()
+    ctx.group.active_ledger_id = ledger.id
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=ledger.id)
+    return AppliedLedgerOp(action_id=action.id, ledger=ledger)
+
+
+async def _apply_switch_ledger(intent: SwitchLedger, ctx: ApplyContext) -> AppliedLedgerOp:
+    """Repoint the active ledger (ADR-0004): anyone may switch; the reply announces it."""
+    ledger = await find_ledger(ctx.session, ctx.group.id, intent.name_or_id)
+    if ledger.status == "archived":
+        raise Rejection(
+            f"📒 {ledger.name} is archived — /unarchive {ledger.name} first, then /switch."
+        )
+    if ledger.id == ctx.group.active_ledger_id:
+        raise Rejection(f"📒 {ledger.name} is already the active ledger.")
+    before = {"active_ledger_id": ctx.group.active_ledger_id}
+    ctx.group.active_ledger_id = ledger.id
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=ledger.id)
+    return AppliedLedgerOp(action_id=action.id, ledger=ledger)
+
+
+async def _apply_archive_ledger(intent: ArchiveLedger, ctx: ApplyContext) -> AppliedLedgerOp:
+    """Archive a ledger (ADR-0004): the active pointer repoints; the LAST open one refuses."""
+    if intent.name_or_id is None:
+        assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+        ledger = await ctx.session.get_one(Ledger, ctx.group.active_ledger_id)
+    else:
+        ledger = await find_ledger(ctx.session, ctx.group.id, intent.name_or_id)
+    if ledger.status == "archived":
+        raise Rejection(f"📒 {ledger.name} is already archived.")
+    replacement = await most_recent_open(ctx.session, ctx.group.id, exclude_id=ledger.id)
+    if replacement is None:
+        raise Rejection(
+            f"🚫 {ledger.name} is the only open ledger — "
+            "create another with /newledger first, then archive this one."
+        )
+    before: dict[str, Any] = {"status": "open", "archived_at": _iso(ledger.archived_at)}
+    repointed = None
+    if ledger.id == ctx.group.active_ledger_id:
+        before["active_ledger_id"] = ctx.group.active_ledger_id
+        ctx.group.active_ledger_id = replacement.id
+        repointed = replacement
+    net = await net_positions(ctx.session, ledger.id)
+    outstanding = any(minor for by_currency in net.values() for minor in by_currency.values())
+    ledger.status = "archived"
+    ledger.archived_at = utcnow()
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=ledger.id)
+    return AppliedLedgerOp(
+        action_id=action.id,
+        ledger=ledger,
+        repointed_to=repointed,
+        outstanding_balances=outstanding,
+    )
+
+
+async def _apply_unarchive_ledger(intent: UnarchiveLedger, ctx: ApplyContext) -> AppliedLedgerOp:
+    """Reopen an archived ledger; the active pointer is NOT touched (§17, ADR-0004)."""
+    ledger = await find_ledger(ctx.session, ctx.group.id, intent.name_or_id)
+    if ledger.status != "archived":
+        raise Rejection(f"📒 {ledger.name} isn't archived — it's already open.")
+    before = {"status": "archived", "archived_at": _iso(ledger.archived_at)}
+    ledger.status = "open"
+    ledger.archived_at = None
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=ledger.id)
+    return AppliedLedgerOp(action_id=action.id, ledger=ledger)
+
+
+def _iso(moment: datetime | None) -> str | None:
+    return moment.isoformat() if moment is not None else None
+
+
 async def _append_action(
-    ctx: ApplyContext, intent: Intent, before_image: dict[str, Any] | None = None
+    ctx: ApplyContext,
+    intent: Intent,
+    before_image: dict[str, Any] | None = None,
+    ledger_id: int | None = None,  # ledger ops pin the action to their TARGET ledger
 ) -> Action:
     actor = _require_actor(ctx)
-    assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+    if ledger_id is None:
+        assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+        ledger_id = ctx.group.active_ledger_id
     action = Action(
-        ledger_id=ctx.group.active_ledger_id,
+        ledger_id=ledger_id,
         actor_user_id=actor.id,
         kind=intent.kind,
         intent_json=intent.model_dump(mode="json"),

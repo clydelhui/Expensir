@@ -29,6 +29,32 @@ class SetHomeCurrency(BaseModel):
     currency: str
 
 
+class SetLoggingCurrency(BaseModel):  # active ledger's new-expense default (ADR-0001)
+    kind: Literal["set_logging_currency"] = "set_logging_currency"
+    currency: str
+
+
+class NewLedger(BaseModel):
+    kind: Literal["new_ledger"] = "new_ledger"
+    name: str
+    logging_currency: str | None = None  # optional trailing ISO on /newledger
+
+
+class SwitchLedger(BaseModel):
+    kind: Literal["switch_ledger"] = "switch_ledger"
+    name_or_id: str
+
+
+class ArchiveLedger(BaseModel):
+    kind: Literal["archive_ledger"] = "archive_ledger"
+    name_or_id: str | None = None  # None -> the active ledger
+
+
+class UnarchiveLedger(BaseModel):  # reopens; does NOT switch (orthogonal verbs, §17)
+    kind: Literal["unarchive_ledger"] = "unarchive_ledger"
+    name_or_id: str
+
+
 class ShowBalance(BaseModel):
     """A read: never confirms, writes no action row (§0.7, §8). Active ledger only."""
 
@@ -39,6 +65,13 @@ class ShowBalance(BaseModel):
 
 # grows into the full §4 discriminated union as slices add kinds
 Intent = Annotated[
-    AddExpense | SetHomeCurrency | ShowBalance,
+    AddExpense
+    | SetHomeCurrency
+    | SetLoggingCurrency
+    | NewLedger
+    | SwitchLedger
+    | ArchiveLedger
+    | UnarchiveLedger
+    | ShowBalance,
     Field(discriminator="kind"),
 ]
