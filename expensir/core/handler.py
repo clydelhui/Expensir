@@ -19,6 +19,7 @@ from expensir.db.models import Group, Ledger, User
 from expensir.domain.apply import (
     AppliedExpense,
     AppliedExpenseChange,
+    AppliedLedgerOp,
     ApplyContext,
     apply_intent,
 )
@@ -31,30 +32,48 @@ from expensir.domain.identity import (
     register_member,
     resolve_expense_id,
 )
+from expensir.domain.ledgers import ledgers_of
 from expensir.domain.money import to_minor
 from expensir.domain.undo import ToggleDirection, toggle
 from expensir.format.keyboards import redo_keyboard, undo_keyboard
-from expensir.format.render import balance_reply, delete_reply, edit_reply, expense_reply
+from expensir.format.render import (
+    LedgerLine,
+    balance_reply,
+    delete_reply,
+    edit_reply,
+    expense_reply,
+    ledgers_reply,
+)
 from expensir.intents.commands import (
     DELETE_USAGE,
     EDIT_USAGE,
     ParsedExpense,
+    parse_archive,
     parse_balance,
+    parse_currency,
     parse_delete,
     parse_edit,
     parse_equal,
     parse_exact,
     parse_homecurrency,
+    parse_newledger,
     parse_percent,
     parse_shares,
+    parse_switch,
+    parse_unarchive,
 )
 from expensir.intents.schema import (
     AddExpense,
+    ArchiveLedger,
     DeleteExpense,
     EditExpense,
+    NewLedger,
     SetHomeCurrency,
+    SetLoggingCurrency,
     ShowBalance,
     SplitMember,
+    SwitchLedger,
+    UnarchiveLedger,
 )
 
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
@@ -254,6 +273,95 @@ async def _run_homecurrency(
     )
 
 
+async def _run_currency(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    currency = parse_currency(message["text"])
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(SetLoggingCurrency(currency=currency), ctx)
+    assert isinstance(applied, AppliedLedgerOp)
+    return Reply(
+        text=(
+            f"📒 {applied.ledger.name} now logs in {currency} — new expenses default to "
+            f"{currency}; existing ones keep their currency."
+        ),
+        undo_action_id=applied.action_id,
+    )
+
+
+async def _run_newledger(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    name, currency = parse_newledger(message["text"])
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(NewLedger(name=name, logging_currency=currency), ctx)
+    assert isinstance(applied, AppliedLedgerOp)
+    logging = f" Logging currency: {currency}." if currency is not None else ""
+    return Reply(
+        text=f"📒 {name} is now the active ledger — new expenses land here.{logging}",
+        undo_action_id=applied.action_id,
+    )
+
+
+async def _run_switch(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    name_or_id = parse_switch(message["text"])
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(SwitchLedger(name_or_id=name_or_id), ctx)
+    assert isinstance(applied, AppliedLedgerOp)
+    return Reply(
+        text=f"📒 Switched to {applied.ledger.name} — new expenses land here.",
+        undo_action_id=applied.action_id,
+    )
+
+
+async def _run_archive(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    name_or_id = parse_archive(message["text"])
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(ArchiveLedger(name_or_id=name_or_id), ctx)
+    assert isinstance(applied, AppliedLedgerOp)
+    text = f"📦 Archived 📒 {applied.ledger.name}."
+    if applied.outstanding_balances:
+        text += " ⚠️ It still has outstanding balances — they stay as they are."
+    if applied.repointed_to is not None:
+        text += f" 📒 {applied.repointed_to.name} is now the active ledger."
+    return Reply(text=text, undo_action_id=applied.action_id)
+
+
+async def _run_unarchive(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    name_or_id = parse_unarchive(message["text"])
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(UnarchiveLedger(name_or_id=name_or_id), ctx)
+    assert isinstance(applied, AppliedLedgerOp)
+    name = applied.ledger.name
+    return Reply(
+        text=f"📂 Reopened 📒 {name} — it's not active; /switch {name} to log expenses there.",
+        undo_action_id=applied.action_id,
+    )
+
+
+async def _run_ledgers(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    # a read: no lock, no action row (§0.7); the one place other ledgers are visible
+    lines = [
+        LedgerLine(
+            ledger_id=ledger.id,
+            name=ledger.name,
+            is_active=ledger.id == group.active_ledger_id,
+            is_archived=ledger.status == "archived",
+            logging_currency=ledger.logging_currency,
+        )
+        for ledger in await ledgers_of(session, group.id)
+    ]
+    return Reply(text=ledgers_reply(lines))
+
+
 def _expense_runner(parse: Callable[[str], ParsedExpense]) -> CommandRunner:
     async def run(
         message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
@@ -421,6 +529,12 @@ async def _run_balance(
 
 _RUNNERS: dict[str, CommandRunner] = {
     "homecurrency": _run_homecurrency,
+    "currency": _run_currency,
+    "newledger": _run_newledger,
+    "ledgers": _run_ledgers,
+    "switch": _run_switch,
+    "archive": _run_archive,
+    "unarchive": _run_unarchive,
     "equal": _expense_runner(parse_equal),
     "exact": _expense_runner(parse_exact),
     "shares": _expense_runner(parse_shares),

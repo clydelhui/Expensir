@@ -20,6 +20,10 @@ EDIT_USAGE = (
     "Usage: reply to the expense with /edit, or /edit <id> — then [YYYY-MM-DD] "
     "[new description]. Amounts and participants can't be edited; delete and re-add instead."
 )
+NEWLEDGER_USAGE = "Usage: /newledger <name> [ISO], e.g. /newledger Tokyo JPY"
+SWITCH_USAGE = "Usage: /switch <ledger>, e.g. /switch Tokyo — /ledgers to see them"
+UNARCHIVE_USAGE = "Usage: /unarchive <ledger>, e.g. /unarchive Tokyo — /ledgers to see them"
+CURRENCY_USAGE = "Usage: /currency <ISO>, e.g. /currency JPY"
 
 _EXPENSE_ID = re.compile(r"^#?(\d+)$")
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -183,8 +187,48 @@ def parse_edit(text: str) -> ParsedEdit:
     return ParsedEdit(expense_id=expense_id, description=description, occurred_on=occurred_on)
 
 
+def parse_newledger(text: str) -> tuple[str, str | None]:
+    """'/newledger Tokyo JPY' -> ('Tokyo', 'JPY'); the ISO is a trailing UPPERCASE token (§3)."""
+    tokens = text.split()[1:]
+    if not tokens:
+        raise ValueError(NEWLEDGER_USAGE)
+    currency = None
+    # a lone ISO-looking token is the NAME ('/newledger JPY' names a ledger, sets nothing)
+    if len(tokens) > 1 and _UPPER_ISO.match(tokens[-1]):
+        currency, tokens = tokens[-1], tokens[:-1]
+    return " ".join(tokens), currency
+
+
+def parse_switch(text: str) -> str:
+    name = " ".join(text.split()[1:])
+    if not name:
+        raise ValueError(SWITCH_USAGE)
+    return name
+
+
+def parse_archive(text: str) -> str | None:
+    """'/archive' -> None (the active ledger); '/archive Tokyo' -> 'Tokyo'."""
+    name = " ".join(text.split()[1:])
+    return name or None
+
+
+def parse_unarchive(text: str) -> str:
+    name = " ".join(text.split()[1:])
+    if not name:
+        raise ValueError(UNARCHIVE_USAGE)
+    return name
+
+
 def parse_homecurrency(text: str) -> str:
+    return _parse_iso(text, HOMECURRENCY_USAGE)
+
+
+def parse_currency(text: str) -> str:
+    return _parse_iso(text, CURRENCY_USAGE)
+
+
+def _parse_iso(text: str, usage: str) -> str:
     tokens = text.split()[1:]
     if len(tokens) != 1 or not _ANY_ISO.match(tokens[0]):
-        raise ValueError(HOMECURRENCY_USAGE)
+        raise ValueError(usage)
     return tokens[0].upper()

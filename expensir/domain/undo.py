@@ -14,11 +14,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from expensir.core.locking import per_group_lock
 from expensir.db.models import Action, Expense, Group, Identity, Ledger, User, utcnow
+from expensir.domain.errors import Rejection
+from expensir.domain.ledgers import has_transactions, most_recent_open
 
 ToggleDirection = Literal["undo", "redo"]
 
 # grows as slices add undoable kinds (§4); setup is permanent and never listed
-REVERSIBLE_KINDS = {"add_expense", "delete_expense", "edit_expense", "set_home_currency"}
+REVERSIBLE_KINDS = {
+    "add_expense",
+    "delete_expense",
+    "edit_expense",
+    "set_home_currency",
+    "set_logging_currency",
+    "new_ledger",
+    "switch_ledger",
+    "archive_ledger",
+    "unarchive_ledger",
+}
 
 
 @dataclass
@@ -63,14 +75,21 @@ async def toggle(
         if direction == "undo":
             name = await _display_name(session, action.undone_by)
             return ToggleOutcome("Already undone.", True, undone_by_name=name)
-        await _reapply(session, action, group)
+        try:
+            await _reapply(session, action, group)
+        except Rejection as refusal:
+            # structural precondition failed (ADR-0004): nothing toggled, button stays
+            return ToggleOutcome(str(refusal), None)
         action.undone_at = None
         action.undone_by = None
         return ToggleOutcome("↪️ Redone.", False)
 
     if direction == "redo":
         return ToggleOutcome("Already redone.", False)
-    await _reverse(session, action, group, now)
+    try:
+        await _reverse(session, action, group, now)
+    except Rejection as refusal:
+        return ToggleOutcome(str(refusal), None)
     action.undone_at = now
     action.undone_by = presser.id
     return ToggleOutcome("↩️ Undone.", True, undone_by_name=presser.display_name)
@@ -85,7 +104,11 @@ def _locked(action: Action, now: datetime, window_hours: int) -> bool:
 
 
 async def _reverse(session: AsyncSession, action: Action, group: Group, now: datetime) -> None:
-    """Reverse the action (§8): soft-delete created rows, or restore the before-image."""
+    """Reverse the action (§8): soft-delete created rows, or restore the before-image.
+
+    A Rejection here refuses the toggle; check every precondition BEFORE mutating,
+    or the partial flip would still commit with the surrounding transaction.
+    """
     if action.kind == "add_expense":
         await session.execute(
             update(Expense).where(Expense.created_by_action_id == action.id).values(deleted_at=now)
@@ -112,6 +135,54 @@ async def _reverse(session: AsyncSession, action: Action, group: Group, now: dat
     elif action.kind == "set_home_currency":
         assert action.before_image is not None
         group.home_currency = action.before_image["home_currency"]
+    elif action.kind == "new_ledger":
+        await _reverse_new_ledger(session, action, group, now)
+    elif action.kind == "switch_ledger":
+        assert action.before_image is not None
+        await _repoint_active(session, group, action.before_image["active_ledger_id"])
+    elif action.kind == "archive_ledger":
+        assert action.before_image is not None
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        ledger.status = action.before_image["status"]
+        ledger.archived_at = _from_iso(action.before_image["archived_at"])
+        if "active_ledger_id" in action.before_image:
+            # the archive repointed; put active back on the just-reopened ledger
+            await _repoint_active(session, group, action.before_image["active_ledger_id"])
+    elif action.kind == "unarchive_ledger":
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        if group.active_ledger_id == ledger.id:
+            # someone switched onto it since; re-archiving the active ledger would
+            # orphan the pointer (ADR-0004)
+            raise Rejection(f"📒 {ledger.name} is the active ledger now — /switch elsewhere first.")
+        assert action.before_image is not None
+        ledger.status = action.before_image["status"]
+        ledger.archived_at = _from_iso(action.before_image["archived_at"])
+    elif action.kind == "set_logging_currency":
+        assert action.before_image is not None
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        ledger.logging_currency = action.before_image["logging_currency"]
+
+
+async def _reverse_new_ledger(
+    session: AsyncSession, action: Action, group: Group, now: datetime
+) -> None:
+    """Archive the created shell and restore the previous active pointer (ADR-0004)."""
+    ledger = await session.get_one(Ledger, action.ledger_id)
+    if await has_transactions(session, ledger.id):
+        raise Rejection(f"📒 {ledger.name} has expenses — delete or archive them first.")
+    previous = None
+    assert action.before_image is not None
+    previous_id = action.before_image["active_ledger_id"]
+    if previous_id is not None:
+        previous = await session.get(Ledger, previous_id)
+    if previous is None or previous.status != "open":
+        # the previous active was archived since: repoint by the archive rule (ADR-0004)
+        previous = await most_recent_open(session, group.id, exclude_id=ledger.id)
+    if previous is None:
+        raise Rejection(f"📒 {ledger.name} is the only open ledger — undoing it would leave none.")
+    ledger.status = "archived"
+    ledger.archived_at = now
+    group.active_ledger_id = previous.id
 
 
 async def _reapply(session: AsyncSession, action: Action, group: Group) -> None:
@@ -146,6 +217,51 @@ async def _reapply(session: AsyncSession, action: Action, group: Group) -> None:
         expense.edited_at = max(filter(None, (others, action.created_at)))
     elif action.kind == "set_home_currency":
         group.home_currency = action.intent_json["currency"]
+    elif action.kind == "new_ledger":
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        ledger.status = "open"
+        ledger.archived_at = None
+        group.active_ledger_id = ledger.id
+    elif action.kind == "switch_ledger":
+        # the switched-to ledger IS the action's ledger; refuse rather than
+        # repoint — redoing a switch onto some other ledger would be a surprise
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        if ledger.status == "archived":
+            raise Rejection(f"📒 {ledger.name} is archived now — /unarchive {ledger.name} first.")
+        group.active_ledger_id = ledger.id
+    elif action.kind == "archive_ledger":
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        if group.active_ledger_id == ledger.id:
+            replacement = await most_recent_open(session, group.id, exclude_id=ledger.id)
+            if replacement is None:
+                raise Rejection(
+                    f"🚫 {ledger.name} is the only open ledger — "
+                    "create another with /newledger first."
+                )
+            group.active_ledger_id = replacement.id
+        ledger.status = "archived"
+        ledger.archived_at = utcnow()
+    elif action.kind == "unarchive_ledger":
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        ledger.status = "open"
+        ledger.archived_at = None
+    elif action.kind == "set_logging_currency":
+        ledger = await session.get_one(Ledger, action.ledger_id)
+        ledger.logging_currency = action.intent_json["currency"]
+
+
+def _from_iso(moment: str | None) -> datetime | None:
+    return datetime.fromisoformat(moment) if moment is not None else None
+
+
+async def _repoint_active(session: AsyncSession, group: Group, ledger_id: int | None) -> None:
+    """Point active back at ledger_id — or, if that ledger is no longer open, at the
+    most-recently-created open ledger (the archive rule, ADR-0004)."""
+    restored = await session.get(Ledger, ledger_id) if ledger_id is not None else None
+    if restored is None or restored.status != "open":
+        restored = await most_recent_open(session, group.id)
+    assert restored is not None  # a group always has an open ledger (ADR-0004)
+    group.active_ledger_id = restored.id
 
 
 async def _target_expense(session: AsyncSession, action: Action) -> Expense:
