@@ -219,3 +219,6 @@ __marimo__/
 
 # Expensir
 *.db
+
+# agent worktrees (never commit)
+.claude/worktrees/
