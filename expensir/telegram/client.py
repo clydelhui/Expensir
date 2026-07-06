@@ -24,6 +24,8 @@ class TelegramClient(Protocol):
         self, callback_query_id: str, text: str | None = None
     ) -> JsonDict: ...
 
+    async def pin_chat_message(self, chat_id: int, message_id: int) -> Any: ...
+
 
 class PollingTelegramClient(TelegramClient, Protocol):
     async def get_updates(self, offset: int, timeout: int) -> list[JsonDict]: ...
@@ -72,6 +74,15 @@ class HttpxTelegramClient:
         if text is not None:
             payload["text"] = text
         return cast(JsonDict, await self._call("answerCallbackQuery", payload))
+
+    async def pin_chat_message(self, chat_id: int, message_id: int) -> Any:
+        # the pin service message is noise next to the board itself: keep it silent
+        payload: JsonDict = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "disable_notification": True,
+        }
+        return await self._call("pinChatMessage", payload)
 
     async def get_me(self) -> JsonDict:
         return cast(JsonDict, await self._call("getMe", {}))

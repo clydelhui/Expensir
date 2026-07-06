@@ -43,4 +43,17 @@ class AnswerCallbackQuery(BaseModel):
     text: str | None = None
 
 
-OutboundAction = SendMessage | EditMessage | EditMessageReplyMarkup | AnswerCallbackQuery
+class PinChatMessage(BaseModel):
+    """Pin the just-created board (§13). Best-effort: pinning needs the bot to be a
+    group admin — on refusal the board stays unpinned and warn_text is sent, which
+    happens once because only board creation emits this action."""
+
+    kind: Literal["pin_chat_message"] = "pin_chat_message"
+    chat_id: int
+    message_id: int
+    warn_text: str | None = None
+
+
+OutboundAction = (
+    SendMessage | EditMessage | EditMessageReplyMarkup | AnswerCallbackQuery | PinChatMessage
+)

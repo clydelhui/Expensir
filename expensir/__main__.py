@@ -22,6 +22,7 @@ def main() -> None:
         bot_username=bot_username,
         operator_user_id=settings.operator_user_id,
         undo_window_hours=settings.undo_window_hours,
+        client=telegram,  # board creation sends inside the locked transaction (ADR-0003)
     )
 
     if settings.mode == "poll":

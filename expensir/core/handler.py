@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expensir.core.board import BoardMessenger, sync_board
 from expensir.core.locking import per_group_lock
 from expensir.core.outbound import (
     AnswerCallbackQuery,
@@ -15,7 +16,7 @@ from expensir.core.outbound import (
     OutboundAction,
     SendMessage,
 )
-from expensir.db.models import Group, Ledger, User
+from expensir.db.models import Action, Group, Ledger, User
 from expensir.domain.apply import (
     AppliedExpense,
     AppliedExpenseChange,
@@ -117,6 +118,9 @@ class Deps:
     bot_username: str | None = None
     operator_user_id: int | None = None  # telegram user id; may undo locked actions (§9)
     undo_window_hours: int = 24
+    # board creation sends inside the locked transaction (ADR-0003); None (tests
+    # without one) skips creation, and the next mutation with a client retries
+    client: BoardMessenger | None = None
 
 
 async def dispatch(update: dict[str, Any], deps: Deps) -> list[OutboundAction]:
@@ -165,6 +169,11 @@ async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[O
             operator_platform_id=deps.operator_user_id,
             window_hours=deps.undo_window_hours,
         )
+        board: list[OutboundAction] = []
+        if outcome.toggled_ledger_id is not None:
+            # an undo/redo is a mutation like any other: its ledger's board
+            # re-renders post-toggle, inside the locked transaction (§13)
+            board = await sync_board(session, group, outcome.toggled_ledger_id, deps.client)
 
     ack.text = outcome.answer
     if outcome.undone is None:
@@ -180,13 +189,14 @@ async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[O
             EditMessageReplyMarkup(
                 chat_id=chat["id"], message_id=message["message_id"], reply_markup=markup
             ),
+            *board,
         ]
     base = _strip_undone_mark(original_text)
     text = f"{base}{UNDONE_MARK}{outcome.undone_by_name or 'someone'}." if outcome.undone else base
     edit = EditMessage(
         chat_id=chat["id"], message_id=message["message_id"], text=text, reply_markup=markup
     )
-    return [ack, edit]
+    return [ack, edit, *board]
 
 
 def _strip_undone_mark(text: str) -> str:
@@ -218,15 +228,21 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
         if runner is not None:
             reply = await _run_command(runner, message, session, group, actor)
             markup = None
+            board: list[OutboundAction] = []
             if reply.undo_action_id is not None:
                 markup = undo_keyboard(reply.undo_action_id)
+                # every mutation re-renders its ledger's board, post-write, still
+                # inside the locked transaction (§13, issue #9)
+                action = await session.get_one(Action, reply.undo_action_id)
+                board = await sync_board(session, group, action.ledger_id, deps.client)
             return [
                 SendMessage(
                     chat_id=message["chat"]["id"],
                     text=reply.text,
                     reply_markup=markup,
                     records_result_for_action_id=reply.undo_action_id,
-                )
+                ),
+                *board,
             ]
 
         text = message.get("text", "")

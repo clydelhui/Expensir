@@ -52,6 +52,18 @@ async def execute(
                 logger.warning(
                     "editMessageReplyMarkup failed; leaving the button stale", exc_info=True
                 )
+        elif action.kind == "pin_chat_message":
+            # best-effort (§13): pinning needs admin rights; on refusal the board
+            # stays unpinned and the warning (creation-only, so once) is sent
+            try:
+                await client.pin_chat_message(chat_id=action.chat_id, message_id=action.message_id)
+            except Exception:
+                logger.warning("pinChatMessage failed; board stays unpinned", exc_info=True)
+                if action.warn_text is not None:
+                    try:
+                        await client.send_message(chat_id=action.chat_id, text=action.warn_text)
+                    except Exception:
+                        logger.warning("pin warning send failed", exc_info=True)
         elif action.kind == "answer_callback_query":
             try:
                 await client.answer_callback_query(

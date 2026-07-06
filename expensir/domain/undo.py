@@ -39,6 +39,9 @@ class ToggleOutcome:
     # current state for syncing the message/keyboard; None -> leave the message alone
     undone: bool | None
     undone_by_name: str | None = None  # who undid it, for the message's "Undone by" line
+    # set only when state actually flipped ("already undone" is a no-op): the
+    # caller re-renders this ledger's board from post-toggle balances (§13)
+    toggled_ledger_id: int | None = None
 
 
 async def toggle(
@@ -82,7 +85,7 @@ async def toggle(
             return ToggleOutcome(str(refusal), None)
         action.undone_at = None
         action.undone_by = None
-        return ToggleOutcome("↪️ Redone.", False)
+        return ToggleOutcome("↪️ Redone.", False, toggled_ledger_id=action.ledger_id)
 
     if direction == "redo":
         return ToggleOutcome("Already redone.", False)
@@ -92,7 +95,12 @@ async def toggle(
         return ToggleOutcome(str(refusal), None)
     action.undone_at = now
     action.undone_by = presser.id
-    return ToggleOutcome("↩️ Undone.", True, undone_by_name=presser.display_name)
+    return ToggleOutcome(
+        "↩️ Undone.",
+        True,
+        undone_by_name=presser.display_name,
+        toggled_ledger_id=action.ledger_id,
+    )
 
 
 def _locked(action: Action, now: datetime, window_hours: int) -> bool:
