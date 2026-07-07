@@ -90,7 +90,7 @@ _Avoid_: dump, snapshot (reserved for the pre-import safety snapshot)
 The single shared contract every input (slash command, natural language, receipt photo) is parsed into before anything downstream runs. The parser is never the source of truth for math or persistence.
 
 **Proposal**:
-A rendered summary of a fuzzy intent (from NL/OCR, or an ambiguous reference) shown with Confirm/Cancel, awaiting a tap. Its intent is stored unresolved and re-resolved at confirm time, but it is pinned to the ledger it was proposed against — confirming commits there even if the group's active ledger changed meanwhile. A reply to a live proposal refines it in place; a reply to a dead one starts a fresh proposal.
+A rendered summary of a fuzzy intent (from NL/OCR, or an ambiguous reference) shown with Confirm/Cancel, awaiting a tap. Its intent is stored unresolved and re-resolved at confirm time, but it is pinned to the ledger it was proposed against — confirming commits there even if the group's active ledger changed meanwhile. Any member may confirm or cancel (the usual anyone-may-act trust model, with Undo as the guardrail); references like "me" keep meaning the proposer, while the action audits the presser as the one who committed it. A reply to a live proposal refines it in place; a reply to a dead one starts a fresh proposal.
 _Avoid_: draft, preview
 
 **Action**:

@@ -112,7 +112,7 @@ that keeps the domain pure and routes all writes through `apply_intent`.
 | Models/validation | **Pydantic v2** + **pydantic-settings** | the Intent contract is Pydantic |
 | ORM / migrations | **SQLAlchemy 2.x (async)** + **Alembic** | |
 | DB | **Postgres** (Neon in prod) / **SQLite** locally | use Neon's **pooled** connection string; the per-group advisory lock (§0.11) needs Postgres, and is a harmless no-op on SQLite (which serializes writes globally) |
-| LLM (text) | **Cloudflare Workers AI**, OpenAI-compatible endpoint | swappable: Groq, Gemini |
+| LLM (text) | any **OpenAI-compatible** endpoint, one client (ADR-0010) | Cloudflare Workers AI default; OpenRouter, DigitalOcean, Groq via `.env` |
 | LLM (vision) | **Cloudflare Workers AI** vision model | swappable: Gemini |
 | FX rates (**display only**) | **Frankfurter** | free, no key, ECB daily, EUR-based (triangulate) |
 | Deploy | **Google Cloud Run** (one container) | portable: Fly.io / Railway / laptop |
@@ -152,8 +152,7 @@ expensir/
 │   │   └── nl.py                # LLM text + vision -> Intent; refine(intent, correction)
 │   ├── llm/
 │   │   ├── base.py              # LLMClient protocol: extract_text / extract_vision / refine
-│   │   ├── cloudflare.py        # default (OpenAI-compatible)
-│   │   ├── groq.py / gemini.py  # swap-ins
+│   │   ├── openai_compat.py     # one client for every OpenAI-compatible provider (ADR-0010)
 │   │   └── prompts.py           # system prompt + few-shot covering EVERY intent kind (§12)
 │   ├── domain/
 │   │   ├── apply.py             # apply_intent — THE forward write path (§8)
@@ -403,10 +402,16 @@ actions          (id, ledger_id, actor_user_id, kind, intent_json JSON, before_i
                    -- before_image: only for pointer/field flips (switch, currency, fx, edit);
                    --   row-creating ops are reversed via created_by_action_id, no before_image.
 
-pending_intents  (id, chat_id, message_id, ledger_id, intent_json JSON, created_at, expires_at)
-                   -- keyed by the PROPOSAL message_id; stores the UNRESOLVED intent (§10)
+pending_intents  (id, chat_id, message_id, ledger_id, proposer_user_id, seed,
+                  intent_json JSON, created_at, expires_at)
+                   -- keyed by the PROPOSAL message_id (NULL until the executor's send
+                   --   reports it back, like actions.result_message_id); stores the
+                   --   UNRESOLVED intent (§10)
                    -- ledger_id = pinned at propose time; confirm commits THERE, not to the
                    --   current active ledger (WYSIWYG, §10)
+                   -- proposer_user_id = whom "me" resolves to at confirm, whoever presses
+                   -- seed = the originating message id, frozen so the shares a proposal
+                   --   shows are exactly the shares that commit (§7.1)
 
 processed_updates(update_id PK, seen_at)                 -- webhook idempotency
 ```
@@ -815,12 +820,11 @@ OPERATOR_USER_ID=            # telegram user id; runs /import, full /export, und
 UNDO_WINDOW_HOURS=24
 PENDING_TTL_MINUTES=15
 
-LLM_TEXT_PROVIDER=cloudflare # cloudflare | groq | gemini
-LLM_VISION_PROVIDER=cloudflare
-CF_ACCOUNT_ID=
-CF_API_TOKEN=
-GROQ_API_KEY=                # only if swapping the text path
-GEMINI_API_KEY=              # only if swapping the vision path
+LLM_BASE_URL=                # any OpenAI-compatible endpoint (ADR-0010), e.g. Cloudflare's
+                             #   https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1
+LLM_API_KEY=
+LLM_MODEL=                   # provider-specific model id — verify in the provider dashboard (§1)
+GEMINI_API_KEY=              # only if swapping the vision path to Gemini's native API (§15.11)
 
 FX_API_BASE=https://api.frankfurter.dev   # no key; ECB daily; same-day cache (§7.5); DISPLAY ONLY
 ```
@@ -864,7 +868,7 @@ Deploy: run Alembic migrations + `setWebhook` as a one-shot release step, not on
    text_mention; bare-username rejection; unknown-reference whole-intent rejection; `left_at` cleared
    on re-join/interaction. *Done when:* an expense naming an unknown person is rejected, a
    reply-`/setup` then lets it commit, and a returned member is back in "everyone".
-10. **NL text path (all intents).** `llm/cloudflare.py` + prompts → any `Intent` kind incl.
+10. **NL text path (all intents).** `llm/openai_compat.py` (ADR-0010) + prompts → any `Intent` kind incl.
     `set_home_currency`/`set_logging_currency`; reads run, mutations confirm; ambiguous-ref pick-list;
     expense-ref resolution; `nl.refine`. *Done when:* "@bot I paid 40 for dinner, split with Sam"
     proposes and disambiguates two Sams; "set home currency to USD" / "switch to Tokyo" map right.

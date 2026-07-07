@@ -5,7 +5,7 @@ Guidance for agents working in the Expensir repo — a Telegram bot for expense 
 ## Authoritative spec
 
 **`ARCHITECTURE-v2.md`** at the repo root is the authoritative, self-contained architecture & build
-spec — build from it. The decisions that shaped it are recorded in `docs/adr/` (ADR-0001–0009), and
+spec — build from it. The decisions that shaped it are recorded in `docs/adr/` (ADR-0001–0010), and
 domain vocabulary lives in `CONTEXT.md`. The original `docs/archive/ARCHITECTURE-v1.md` is **archived
 and must not be used** — several of its locked decisions were reversed (see the ADRs).
 
