@@ -24,6 +24,7 @@ from expensir.domain.apply import (
     AppliedExpenseChange,
     AppliedLedgerOp,
     AppliedSettlement,
+    AppliedSetup,
     ApplyContext,
     apply_intent,
 )
@@ -33,6 +34,7 @@ from expensir.domain.errors import Rejection
 from expensir.domain.identity import (
     display_names,
     ensure_group,
+    mark_left,
     register_member,
     resolve_expense_id,
     resolve_refs,
@@ -79,6 +81,8 @@ from expensir.intents.schema import (
     SetHomeCurrency,
     SetLoggingCurrency,
     SettleUp,
+    Setup,
+    SetupTarget,
     ShowBalance,
     SplitMember,
     SwitchLedger,
@@ -417,6 +421,22 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
         if "from" in message:
             actor = await _register_author(session, group.id, message["from"])
 
+        joined = message.get("new_chat_members")
+        if joined is not None:
+            # join carries full live User objects (§11): auto-register each; a
+            # departed member re-joining reactivates. Lifecycle event — no reply.
+            for tg_user in joined:
+                await _register_author(session, group.id, tg_user)  # skips bots
+            return []
+
+        left = message.get("left_chat_member")
+        if left is not None:
+            # processed AFTER author registration: a voluntary leaver's own `from`
+            # must not outlive their leave (§11). Lifecycle event — no reply.
+            if not left.get("is_bot"):
+                await mark_left(session, group.id, left["id"])
+            return []
+
         command = _command_of(message.get("text", ""), deps.bot_username)
         if command == "start":
             active = await session.get_one(Ledger, group.active_ledger_id)
@@ -432,6 +452,7 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
                 # every mutation re-renders its ledger's board, post-write, still
                 # inside the locked transaction (§13, issue #9)
                 action = await session.get_one(Action, reply.undo_action_id)
+                assert action.ledger_id is not None  # every undoable kind is ledger activity
                 board = await sync_board(session, group, action.ledger_id, deps.client)
             return [
                 SendMessage(
@@ -781,7 +802,86 @@ async def _run_balance(
     return Reply(text=balance_reply(ledger_name=ledger.name, entries=entries))
 
 
+async def _run_setup(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    """/setup registers pre-existing members (§11): reply target and text_mentions.
+
+    Permanent — the Reply never carries an undo_action_id, so no Undo button."""
+    targets, bare_usernames, bot_names = _setup_entries(message)
+    if not targets and not bare_usernames and not bot_names:
+        return Reply(
+            text=(
+                "👥 To register someone who hasn't spoken yet, reply to one of their "
+                "messages with /setup, or mention them by tapping their name so the "
+                "mention links their account. A bare @username isn't enough."
+            )
+        )
+
+    registered: list[User] = []
+    already: list[User] = []
+    departed: list[User] = []
+    if targets:
+        ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+        applied = await apply_intent(Setup(targets=targets), ctx)
+        assert isinstance(applied, AppliedSetup)
+        registered, already, departed = applied.registered, applied.already, applied.departed
+    lines = [
+        f"✅ Registered {member.display_name} — they can now appear in expenses and settlements."
+        for member in registered
+    ]
+    lines += [f"👥 {member.display_name} is already a member." for member in already]
+    lines += [
+        f"🚪 {member.display_name} left the group — their balances are kept, and they'll "
+        "be back in once they re-join or send a message here themselves."
+        for member in departed
+    ]
+    lines += [
+        f"🚫 {username} can't be added from a bare @username — Telegram doesn't let me "
+        "look accounts up by name. They can send a message here once, or someone can "
+        "reply to one of their messages with /setup."
+        for username in bare_usernames
+    ]
+    lines += [f"🚫 {name} is a bot — bots can't be members." for name in bot_names]
+    return Reply(text="\n".join(lines))
+
+
+def _setup_entries(message: dict[str, Any]) -> tuple[list[SetupTarget], list[str], list[str]]:
+    """Everyone a /setup names (§11): resolvable targets (the reply target and
+    text_mentions, which embed the user id), bare @usernames (unresolvable by the
+    Bot API), and bots (never members)."""
+    targets: list[SetupTarget] = []
+    bare_usernames: list[str] = []
+    bot_names: list[str] = []
+
+    def collect(tg_user: dict[str, Any]) -> None:
+        if tg_user.get("is_bot"):
+            bot_names.append(_display_name(tg_user))  # no ghosts, no bot members (§11)
+        else:
+            targets.append(_setup_target(tg_user))
+
+    reply_to = message.get("reply_to_message")
+    if reply_to is not None and "from" in reply_to:
+        collect(reply_to["from"])
+    text = message.get("text", "")
+    for entity in message.get("entities", []):
+        if entity["type"] == "text_mention":
+            collect(entity["user"])
+        elif entity["type"] == "mention":
+            bare_usernames.append(text[entity["offset"] : entity["offset"] + entity["length"]])
+    return targets, bare_usernames, bot_names
+
+
+def _setup_target(tg_user: dict[str, Any]) -> SetupTarget:
+    return SetupTarget(
+        platform_user_id=tg_user["id"],
+        display_name=_display_name(tg_user),
+        username=tg_user.get("username"),
+    )
+
+
 _RUNNERS: dict[str, CommandRunner] = {
+    "setup": _run_setup,
     "homecurrency": _run_homecurrency,
     "currency": _run_currency,
     "newledger": _run_newledger,

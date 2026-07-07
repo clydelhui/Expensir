@@ -4,11 +4,13 @@ Platform-agnostic: callers at the transport-aware edge extract primitives from t
 Telegram update; nothing here imports Telegram shapes.
 """
 
-from sqlalchemy import Select, func, select
+from typing import Literal
+
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from expensir.db.models import Action, Expense, Group, GroupMember, Identity, Ledger, User
+from expensir.db.models import Action, Expense, Group, GroupMember, Identity, Ledger, User, utcnow
 from expensir.domain.errors import Rejection
 
 
@@ -171,6 +173,70 @@ async def registered_members(session: AsyncSession, group_id: int) -> list[User]
     )
 
 
+async def _identity_of(session: AsyncSession, platform_user_id: int) -> Identity | None:
+    return (
+        await session.execute(
+            select(Identity).where(
+                Identity.platform == "telegram",
+                Identity.platform_user_id == platform_user_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _membership_of(session: AsyncSession, group_id: int, user_id: int) -> GroupMember | None:
+    return (
+        await session.execute(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id, GroupMember.user_id == user_id
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def mark_left(session: AsyncSession, group_id: int, platform_user_id: int) -> None:
+    """Leaving (§11): set left_at. Balances persist and history stays intact, but the
+    member drops out of "everyone" and is no longer nameable until reactivation.
+
+    A never-registered leaver is ignored — registering someone as they leave would
+    mint a departed member with no history (no ghosts).
+    """
+    identity = await _identity_of(session, platform_user_id)
+    if identity is None:
+        return
+    membership = await _membership_of(session, group_id, identity.user_id)
+    if membership is not None:
+        membership.left_at = utcnow()
+
+
+SetupOutcome = Literal["registered", "already", "departed"]
+
+
+async def register_setup_target(
+    session: AsyncSession,
+    group_id: int,
+    platform_user_id: int,
+    display_name: str,
+    username: str | None,
+) -> tuple[User, SetupOutcome]:
+    """Register one /setup target from SNAPSHOT data (§11).
+
+    Snapshots seed unknown people but never touch an existing member — no identity
+    refresh, no reactivation; only the member's own live interaction does those.
+    Returns the member and which per-entry reply line applies.
+    """
+    identity = await _identity_of(session, platform_user_id)
+    if identity is not None:
+        membership = await _membership_of(session, group_id, identity.user_id)
+        if membership is not None:
+            member = await session.get_one(User, identity.user_id)
+            # reactivation is strictly self-triggered (§11): a departed member stays
+            # departed no matter who names them in a /setup
+            return member, "departed" if membership.left_at is not None else "already"
+    member = await register_member(session, group_id, platform_user_id, display_name, username)
+    return member, "registered"
+
+
 async def register_member(
     session: AsyncSession,
     group_id: int,
@@ -179,14 +245,7 @@ async def register_member(
     username: str | None,
 ) -> User:
     """Register the author of an interaction: users + identities + group_members rows."""
-
-    def identity_query() -> Select[tuple[Identity]]:
-        return select(Identity).where(
-            Identity.platform == "telegram",
-            Identity.platform_user_id == platform_user_id,
-        )
-
-    identity = (await session.execute(identity_query())).scalar_one_or_none()
+    identity = await _identity_of(session, platform_user_id)
     if identity is None:
         try:
             async with session.begin_nested():
@@ -202,18 +261,18 @@ async def register_member(
                 session.add(identity)
                 await session.flush()
         except IntegrityError:  # lost the race to a concurrent update for the same person
-            identity = (await session.execute(identity_query())).scalar_one()
+            identity = await _identity_of(session, platform_user_id)
+            assert identity is not None  # the loser reads the winner's row
             member = await session.get_one(User, identity.user_id)
     else:
         member = await session.get_one(User, identity.user_id)
+        # identity refresh (§11): every caller passes LIVE User data (the update's own
+        # `from` or a new_chat_members entry — snapshots go through register_setup_target
+        # instead), so stored names track reality and @resolution never goes stale
+        identity.username = username
+        member.display_name = display_name
 
-    membership = (
-        await session.execute(
-            select(GroupMember).where(
-                GroupMember.group_id == group_id, GroupMember.user_id == member.id
-            )
-        )
-    ).scalar_one_or_none()
+    membership = await _membership_of(session, group_id, member.id)
     if membership is None:
         try:
             async with session.begin_nested():
@@ -221,4 +280,8 @@ async def register_member(
                 await session.flush()
         except IntegrityError:
             pass  # a concurrent update already created the membership
+    elif membership.left_at is not None:
+        # reactivation (§11): a departed member re-joining or interacting is back in
+        # "everyone" — same row, balances intact. Lifecycle event, no action row.
+        membership.left_at = None
     return member

@@ -72,6 +72,46 @@ def callback_update(
     }
 
 
+def left_member_update(
+    update_id: int = 4,
+    chat_id: int = -100500,
+    member: dict | None = None,
+    by: dict | None = None,  # None -> a voluntary leave: `from` is the leaver
+    message_id: int = 20,
+) -> dict:
+    member = member or user()
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": message_id,
+            "chat": group_chat(chat_id),
+            "from": by or member,
+            "date": 1751400000,
+            "left_chat_member": member,
+        },
+    }
+
+
+def joined_members_update(
+    update_id: int = 5,
+    chat_id: int = -100500,
+    members: list[dict] | None = None,
+    by: dict | None = None,  # None -> the first joiner joined by themselves
+    message_id: int = 21,
+) -> dict:
+    members = members if members is not None else [user()]
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": message_id,
+            "chat": group_chat(chat_id),
+            "from": by or members[0],
+            "date": 1751400000,
+            "new_chat_members": members,
+        },
+    }
+
+
 def message_update(
     update_id: int = 2,
     chat_id: int = -100500,
@@ -81,6 +121,7 @@ def message_update(
     message_id: int = 10,
     reply_to_message_id: int | None = None,
     reply_to_from: dict | None = None,
+    entities: list[dict] | None = None,
 ) -> dict:
     message = {
         "message_id": message_id,
@@ -89,6 +130,8 @@ def message_update(
         "date": 1751400000,
         "text": text,
     }
+    if entities is not None:
+        message["entities"] = entities
     if reply_to_message_id is not None:
         message["reply_to_message"] = {
             "message_id": reply_to_message_id,

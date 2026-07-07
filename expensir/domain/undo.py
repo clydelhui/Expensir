@@ -73,12 +73,15 @@ async def toggle(
     action = await session.get(Action, action_id)
     if action is None:
         return ToggleOutcome("That button doesn't match anything I recorded.", None)
+    if action.kind not in REVERSIBLE_KINDS:
+        # checked before ownership: a permanent action never flips, and group-scoped
+        # kinds (setup, §11) have no ledger to derive ownership from
+        return ToggleOutcome("That action is permanent — it can't be undone.", None)
+    assert action.ledger_id is not None  # every reversible kind is ledger activity
     ledger = await session.get_one(Ledger, action.ledger_id)
     if ledger.group_id != group.id:
         # a forged/foreign callback: never toggle across groups
         return ToggleOutcome("That button doesn't match anything I recorded.", None)
-    if action.kind not in REVERSIBLE_KINDS:
-        return ToggleOutcome("That action is permanent — it can't be undone.", None)
 
     now = utcnow()
     if _locked(action, now, window_hours) and presser_platform_id != operator_platform_id:
@@ -126,6 +129,7 @@ async def _credits_if_settled_against(session: AsyncSession, action: Action) -> 
     currency = action.intent_json.get("currency")
     if not isinstance(currency, str):
         return {}
+    assert action.ledger_id is not None  # add_expense is ledger activity
     return await overpayment_credits(session, action.ledger_id, currency)
 
 
@@ -138,6 +142,7 @@ async def _overpayment_warning(
     currency = action.intent_json.get("currency")
     if not isinstance(currency, str):
         return ""
+    assert action.ledger_id is not None  # add_expense is ledger activity
     credits_after = await overpayment_credits(session, action.ledger_id, currency)
     grown = {u: c for u, c in credits_after.items() if c > credits_before.get(u, 0)}
     if not grown:

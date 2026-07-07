@@ -719,9 +719,13 @@ currency resolves to nothing (§3) is rejected with the set-a-currency prompt.
 **Leaving.** On `left_chat_member`, set `group_members.left_at`. Balances persist; the user stays
 referenceable by id but is excluded from future "everyone" — until reactivation.
 
-**Identity refresh.** Usernames and display names change. Every update carrying a Telegram `User`
-object refreshes that member's stored `username`/`display_name` so `@username` resolution never
-works from stale data. Lifecycle behavior — no action row, not undoable.
+**Identity refresh.** Usernames and display names change. Every update refreshes the stored
+`username`/`display_name` of members it carries **live** `User` objects for — the top-level `from`
+(the interacting author) and `new_chat_members` entries — so `@username` resolution never works from
+stale data. Snapshot `User` objects (`reply_to_message.from`, `text_mention` entities) are as-of the
+original message: they may seed a new registration via `/setup`, but never overwrite an existing
+member's stored identity — the member's own next interaction is what heals staleness. Lifecycle
+behavior — no action row, not undoable.
 
 **Supergroup migration.** Telegram upgrades a basic group to a supergroup when certain settings
 change — granting the bot admin rights so it can pin the board is a common trigger — and the chat

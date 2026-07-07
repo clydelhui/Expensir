@@ -82,7 +82,8 @@ class Action(Base):
     __table_args__ = (Index("ix_actions_ledger_undone", "ledger_id", "undone_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    ledger_id: Mapped[int] = mapped_column(ForeignKey("ledgers.id"))
+    # None for group-scoped actions (setup, §11): registration is no ledger's activity
+    ledger_id: Mapped[int | None] = mapped_column(ForeignKey("ledgers.id"))
     actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     kind: Mapped[str] = mapped_column(String)
     intent_json: Mapped[dict[str, Any]] = mapped_column(JSON)

@@ -19,8 +19,18 @@ A ledger closed to new activity. Its balances are preserved and readable, but it
 _Avoid_: deleted ledger, closed ledger
 
 **Member**:
-A person the bot has registered in a group (it has seen their Telegram account). Only members may appear in a transaction — there are no ghosts.
+A person the bot has registered in a group (it has seen their Telegram account). Only current members may appear in a new transaction — there are no ghosts.
 _Avoid_: user (reserved for the platform-agnostic identity), participant (reserved for the people on a single expense)
+
+**Departed member**:
+A member the bot has seen leave the group. Their balances and history persist untouched, but to new activity they are unknown: excluded from "everyone" and not nameable in new expenses or settlements until reactivated. Departure narrows the language, not the books.
+_Avoid_: removed member, deleted member, ex-member
+
+**Identity refresh**:
+Keeping a member's stored username and display name current so references never resolve from stale data. Trusts only live sources — data the person themself just carried into the chat (their own message, tap, or join). Snapshots embedded in old messages (a reply target, a tapped mention) may seed a brand-new registration but never overwrite what is already stored. A lifecycle event — writes no action, not undoable.
+
+**Reactivation**:
+A departed member becoming a current member again, with the same identity and balances. Strictly self-triggered: the bot seeing them re-join, or any interaction of their own (a message, a tap, running a command — including `/setup`). No third party can reactivate them — a `/setup` naming a departed member does not bring them back. A lifecycle event like the original join — writes no action, not undoable.
 
 ### Currency
 
@@ -84,7 +94,7 @@ A rendered summary of a fuzzy intent (from NL/OCR, or an ambiguous reference) sh
 _Avoid_: draft, preview
 
 **Action**:
-One audited, reversible unit of change. Every mutation appends exactly one action row, and every data row it writes carries that action's id, so undo is "soft-delete everything this action created." Reads and registration write no action.
+One audited, reversible unit of change. Every mutation appends exactly one action row, and every data row it writes carries that action's id, so undo is "soft-delete everything this action created." Reads and lifecycle events (join, leave, reactivation, identity refresh) write no action; registration via `/setup` appends one — permanent, with no undo.
 _Avoid_: event, transaction (reserved for the DB transaction), operation
 
 **Confidence**:

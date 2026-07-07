@@ -16,7 +16,7 @@ from expensir.domain.allocate import allocate
 from expensir.domain.balances import net_positions
 from expensir.domain.currency import require_known_currency
 from expensir.domain.errors import Rejection
-from expensir.domain.identity import registered_members, resolve_refs
+from expensir.domain.identity import register_setup_target, registered_members, resolve_refs
 from expensir.domain.ledgers import find_ledger, most_recent_open
 from expensir.domain.money import fmt
 from expensir.domain.settle import record_settlement
@@ -30,6 +30,7 @@ from expensir.intents.schema import (
     SetHomeCurrency,
     SetLoggingCurrency,
     SettleUp,
+    Setup,
     SwitchLedger,
     UnarchiveLedger,
 )
@@ -89,7 +90,24 @@ class AppliedLedgerOp:
     outstanding_balances: bool = False  # archive warns but proceeds (§17)
 
 
-Applied = AppliedExpense | AppliedFlip | AppliedExpenseChange | AppliedSettlement | AppliedLedgerOp
+@dataclass
+class AppliedSetup:
+    """setup (§11): permanent — action_id is recorded but NEVER an Undo affordance (§8)."""
+
+    action_id: int | None  # None when nothing was actually registered
+    registered: list[User]
+    already: list[User]  # targets who were current members all along; no rows written
+    departed: list[User]  # targets who left: /setup never reactivates them (§11)
+
+
+Applied = (
+    AppliedExpense
+    | AppliedFlip
+    | AppliedExpenseChange
+    | AppliedSettlement
+    | AppliedLedgerOp
+    | AppliedSetup
+)
 
 
 async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
@@ -115,6 +133,8 @@ async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
         return await _apply_archive_ledger(intent, ctx)
     if isinstance(intent, UnarchiveLedger):
         return await _apply_unarchive_ledger(intent, ctx)
+    if isinstance(intent, Setup):
+        return await _apply_setup(intent, ctx)
     return None
 
 
@@ -413,6 +433,42 @@ async def _apply_unarchive_ledger(intent: UnarchiveLedger, ctx: ApplyContext) ->
     ledger.archived_at = None
     action = await _append_action(ctx, intent, before_image=before, ledger_id=ledger.id)
     return AppliedLedgerOp(action_id=action.id, ledger=ledger)
+
+
+async def _apply_setup(intent: Setup, ctx: ApplyContext) -> AppliedSetup:
+    """Register pre-existing members (§11). Appends a group-scoped action row
+    (ledger_id=None) — permanent, no Undo affordance (§8)."""
+    actor = _require_actor(ctx)
+    outcomes: dict[str, list[User]] = {"registered": [], "already": [], "departed": []}
+    for target in intent.targets:
+        member, outcome = await register_setup_target(
+            ctx.session,
+            ctx.group.id,
+            platform_user_id=target.platform_user_id,
+            display_name=target.display_name,
+            username=target.username,
+        )
+        outcomes[outcome].append(member)
+    registered, already, departed = (
+        outcomes["registered"],
+        outcomes["already"],
+        outcomes["departed"],
+    )
+    if not registered:
+        # the action row audits change; a /setup that changed nothing appends none
+        return AppliedSetup(action_id=None, registered=[], already=already, departed=departed)
+    action = Action(
+        ledger_id=None,
+        actor_user_id=actor.id,
+        kind=intent.kind,
+        intent_json=intent.model_dump(mode="json"),
+        before_image=None,
+    )
+    ctx.session.add(action)
+    await ctx.session.flush()
+    return AppliedSetup(
+        action_id=action.id, registered=registered, already=already, departed=departed
+    )
 
 
 def _iso(moment: datetime | None) -> str | None:

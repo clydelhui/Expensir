@@ -86,6 +86,22 @@ class UnarchiveLedger(BaseModel):  # reopens; does NOT switch (orthogonal verbs,
     name_or_id: str
 
 
+class SetupTarget(BaseModel):
+    """One person a /setup names, resolved by the router from the reply target or a
+    text_mention entity — the only Telegram shapes that embed the user id (§11)."""
+
+    platform_user_id: int
+    display_name: str
+    username: str | None = None
+
+
+class Setup(BaseModel):
+    """Register pre-existing members (§11). Permanent: no Undo affordance (§8)."""
+
+    kind: Literal["setup"] = "setup"
+    targets: list[SetupTarget] = []
+
+
 class ShowBalance(BaseModel):
     """A read: never confirms, writes no action row (§0.7, §8). Active ledger only."""
 
@@ -106,6 +122,7 @@ Intent = Annotated[
     | SwitchLedger
     | ArchiveLedger
     | UnarchiveLedger
+    | Setup
     | ShowBalance,
     Field(discriminator="kind"),
 ]
