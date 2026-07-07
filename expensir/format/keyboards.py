@@ -32,5 +32,26 @@ def board_keyboard(transfers: list[BoardLine]) -> InlineKeyboard | None:
     }
 
 
+def sheet_keyboard(ledger_id: int, transfers: list[BoardLine]) -> InlineKeyboard | None:
+    """Per-line [Settle] buttons for the settle sheet (ADR-0007): same WYSIWYG
+    amount token as the board, plus the ledger id — a sheet message is not the
+    pinned board, so the tap can't resolve its ledger from the message itself."""
+    if not transfers:
+        return None
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": f"🤝 Settle {t.from_name} → {t.to_name} "
+                    f"{fmt(t.amount_minor, t.currency)}",
+                    "callback_data": f"v1:sh:{ledger_id}:{t.from_id}:{t.to_id}"
+                    f":{t.currency}:{t.amount_minor}",
+                }
+            ]
+            for t in transfers
+        ]
+    }
+
+
 def redo_keyboard(action_id: int) -> InlineKeyboard:
     return {"inline_keyboard": [[{"text": "↪️ Redo", "callback_data": f"v1:redo:{action_id}"}]]}

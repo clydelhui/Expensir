@@ -26,7 +26,8 @@ UNARCHIVE_USAGE = "Usage: /unarchive <ledger>, e.g. /unarchive Tokyo — /ledger
 CURRENCY_USAGE = "Usage: /currency <ISO>, e.g. /currency JPY"
 SETTLE_USAGE = (
     "Usage: /settle [@from] @to <amount> <ISO>, e.g. /settle @alice 30 EUR — "
-    "records that @from (you, if omitted) paid @to."
+    "records that @from (you, if omitted) paid @to. Bare /settle @name shows "
+    "what's left to settle between you two."
 )
 
 _EXPENSE_ID = re.compile(r"^#?(\d+)$")
@@ -137,17 +138,19 @@ def _parse_valued_split(
 
 @dataclass
 class ParsedSettle:
-    """The custom settle (§7.3): a directed pair, an amount, an explicit currency."""
+    """The custom settle (§7.3): a directed pair, an amount, an explicit currency —
+    or the settle sheet when amount is None (ADR-0007: the pair is then unordered)."""
 
     from_ref: str  # "me" when the speaker left themselves implicit
     to_ref: str
-    amount: str
-    currency: str
+    amount: str | None
+    currency: str | None
 
 
 def parse_settle(text: str) -> ParsedSettle:
     """'/settle [@from] @to <amount> <ISO>' — the ISO is required: a settlement
-    with an amount never falls back to ledger/home resolution (§4)."""
+    with an amount never falls back to ledger/home resolution (§4).
+    No amount at all ('/settle @x') is the settle sheet, a read (ADR-0007)."""
     tokens = text.split()[1:]
     mentions = [t for t in tokens if t.startswith("@")]
     rest = [t for t in tokens if not t.startswith("@")]
@@ -157,6 +160,8 @@ def parse_settle(text: str) -> ParsedSettle:
         from_ref, to_ref = mentions
     else:
         raise ValueError(SETTLE_USAGE)
+    if not rest:
+        return ParsedSettle(from_ref=from_ref, to_ref=to_ref, amount=None, currency=None)
     if len(rest) != 2 or not _AMOUNT.match(rest[0]) or not _ANY_ISO.match(rest[1]):
         raise ValueError(SETTLE_USAGE)
     return ParsedSettle(from_ref=from_ref, to_ref=to_ref, amount=rest[0], currency=rest[1].upper())

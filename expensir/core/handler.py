@@ -17,6 +17,7 @@ from expensir.core.outbound import (
     OutboundAction,
     SendMessage,
 )
+from expensir.core.sheet import sheet_view
 from expensir.db.models import Action, Group, Ledger, User
 from expensir.domain.apply import (
     AppliedExpense,
@@ -34,12 +35,13 @@ from expensir.domain.identity import (
     ensure_group,
     register_member,
     resolve_expense_id,
+    resolve_refs,
 )
 from expensir.domain.ledgers import ledgers_of
 from expensir.domain.money import to_minor
 from expensir.domain.settle import record_settlement, suggested_amount
 from expensir.domain.undo import ToggleDirection, toggle
-from expensir.format.keyboards import redo_keyboard, undo_keyboard
+from expensir.format.keyboards import InlineKeyboard, redo_keyboard, undo_keyboard
 from expensir.format.render import (
     LedgerLine,
     balance_reply,
@@ -86,6 +88,9 @@ from expensir.intents.schema import (
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
 # the board [Settle] button (ADR-0006): tuple + shown amount as a staleness token
 _SETTLE_DATA = re.compile(r"^v1:st:(\d+):(\d+):([A-Z]{3}):(\d+)$")
+# a settle-sheet line (ADR-0007): same tuple + token, prefixed with the ledger —
+# a sheet message is not the pinned board, so the tap can't resolve it from the chat
+_SHEET_DATA = re.compile(r"^v1:sh:(\d+):(\d+):(\d+):([A-Z]{3}):(\d+)$")
 _UNDO_WORDS = re.compile(r"\b(undo|undid|redo)\b", re.IGNORECASE)
 _MENTION = re.compile(r"@\w+")
 UNDONE_MARK = "\n\n↩️ Undone by "
@@ -96,10 +101,14 @@ UNDO_POINTER = (
 
 @dataclass
 class Reply:
-    """A command's rendered result; undo_action_id marks it undoable (§9)."""
+    """A command's rendered result; undo_action_id marks it undoable (§9).
+
+    markup is for reads that carry their own buttons (the settle sheet,
+    ADR-0007); an undoable result's Undo keyboard wins over it."""
 
     text: str
     undo_action_id: int | None = None
+    markup: InlineKeyboard | None = None
 
 
 CommandRunner = Callable[[dict[str, Any], AsyncSession, Group, User | None], Awaitable[Reply]]
@@ -153,6 +162,9 @@ async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[O
     settle = _SETTLE_DATA.match(callback.get("data") or "")
     if settle is not None:
         return await _handle_settle_tap(callback, settle, deps)
+    sheet = _SHEET_DATA.match(callback.get("data") or "")
+    if sheet is not None:
+        return await _handle_sheet_tap(callback, sheet, deps)
     match = _TOGGLE_DATA.match(callback.get("data") or "")
     if match is None:
         return [ack]  # not a button of any slice so far; acknowledge so the spinner stops
@@ -247,9 +259,7 @@ async def _handle_settle_tap(
         # recompute under the lock (ADR-0006): the shown amount is only a token
         await per_group_lock(session, group.id)
         await session.refresh(group)
-        net = await net_positions(session, ledger.id)
-        net_ccy = {user_id: by_ccy.get(currency, 0) for user_id, by_ccy in net.items()}
-        current = suggested_amount(net_ccy, from_id, to_id)
+        current = await _current_suggested(session, ledger.id, from_id, to_id, currency)
         if current != shown_minor:
             ack.text = (
                 "Already settled."
@@ -262,38 +272,129 @@ async def _handle_settle_tap(
         # both ids sit in a transfer simplify just proposed, so the rows exist
         payer = await session.get_one(User, from_id)
         receiver = await session.get_one(User, to_id)
-        recorded = await record_settlement(
-            session,
-            ledger_id=ledger.id,
-            actor=presser,
-            payer=payer,
-            receiver=receiver,
-            intent=SettleUp(
-                from_ref=payer.display_name,
-                to_ref=receiver.display_name,
-                amount_minor=shown_minor,
-                currency=currency,
-            ),
+        result = await _record_settle_tap(
+            session, ledger, presser, payer, receiver, currency, shown_minor, chat["id"]
         )
         board = await sync_board(session, group, ledger.id, deps.client)
-        text = settle_reply(
-            ledger_name=ledger.name,
-            from_name=payer.display_name,
-            to_name=receiver.display_name,
-            amount_minor=shown_minor,
-            currency=currency,
-        )
     ack.text = "🤝 Recorded."
-    return [
-        ack,
-        SendMessage(
-            chat_id=chat["id"],
-            text=text,
-            reply_markup=undo_keyboard(recorded.action_id),
-            records_result_for_action_id=recorded.action_id,
+    return [ack, result, *board]
+
+
+async def _handle_sheet_tap(
+    callback: dict[str, Any], match: re.Match[str], deps: Deps
+) -> list[OutboundAction]:
+    """A settle-sheet [Settle] tap (ADR-0007): the board tap's WYSIWYG guard,
+    plus the sheet itself refreshes in place on every outcome — it is the
+    surface the presser is looking at."""
+    ack = AnswerCallbackQuery(callback_query_id=callback["id"])
+    ledger_id = int(match.group(1))
+    from_id, to_id = int(match.group(2)), int(match.group(3))
+    currency, shown_minor = match.group(4), int(match.group(5))
+
+    message = callback.get("message") or {}
+    chat = message.get("chat")
+    if chat is None or chat["type"] not in ("group", "supergroup"):
+        return [ack]
+
+    async with deps.session_factory() as session, session.begin():
+        group = await ensure_group(session, chat["id"], chat.get("title"))
+        presser = await _register_author(session, group.id, callback["from"])
+        if presser is None:
+            ack.text = "I can't tell who pressed that — anonymous admins can't record settlements."
+            return [ack]
+        ledger = await session.get(Ledger, ledger_id)
+        payer = await session.get(User, from_id)
+        receiver = await session.get(User, to_id)
+        if ledger is None or ledger.group_id != group.id or payer is None or receiver is None:
+            ack.text = "That button doesn't match anything I recorded."
+            return [ack]
+
+        # recompute under the lock (ADR-0006): the shown amount is only a token
+        await per_group_lock(session, group.id)
+        await session.refresh(group)
+        current = await _current_suggested(session, ledger.id, from_id, to_id, currency)
+        sheet_message_id = message.get("message_id")
+        if current != shown_minor:
+            ack.text = (
+                "Already settled."
+                if current is None
+                else "⚠️ The sheet was out of date — nothing recorded. Tap again."
+            )
+            sheet = await _refresh_sheet(session, ledger, payer, receiver, chat, sheet_message_id)
+            return [ack, *sheet]
+
+        result = await _record_settle_tap(
+            session, ledger, presser, payer, receiver, currency, shown_minor, chat["id"]
+        )
+        board = await sync_board(session, group, ledger.id, deps.client)
+        sheet = await _refresh_sheet(session, ledger, payer, receiver, chat, sheet_message_id)
+    ack.text = "🤝 Recorded."
+    return [ack, result, *sheet, *board]
+
+
+async def _current_suggested(
+    session: AsyncSession, ledger_id: int, from_id: int, to_id: int, currency: str
+) -> int | None:
+    """The transfer a tap's amount token must match, recomputed under the lock
+    (ADR-0006); None means the line is gone."""
+    net = await net_positions(session, ledger_id)
+    net_ccy = {user_id: by_ccy.get(currency, 0) for user_id, by_ccy in net.items()}
+    return suggested_amount(net_ccy, from_id, to_id)
+
+
+async def _record_settle_tap(
+    session: AsyncSession,
+    ledger: Ledger,
+    presser: User,
+    payer: User,
+    receiver: User,
+    currency: str,
+    amount_minor: int,
+    chat_id: int,
+) -> SendMessage:
+    """Record one fresh [Settle] tap — board or sheet line, the same thing:
+    one settlement, one action, its own Undo (ADR-0006, ADR-0007)."""
+    recorded = await record_settlement(
+        session,
+        ledger_id=ledger.id,
+        actor=presser,
+        payer=payer,
+        receiver=receiver,
+        intent=SettleUp(
+            from_ref=payer.display_name,
+            to_ref=receiver.display_name,
+            amount_minor=amount_minor,
+            currency=currency,
         ),
-        *board,
-    ]
+    )
+    text = settle_reply(
+        ledger_name=ledger.name,
+        from_name=payer.display_name,
+        to_name=receiver.display_name,
+        amount_minor=amount_minor,
+        currency=currency,
+    )
+    return SendMessage(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=undo_keyboard(recorded.action_id),
+        records_result_for_action_id=recorded.action_id,
+    )
+
+
+async def _refresh_sheet(
+    session: AsyncSession,
+    ledger: Ledger,
+    a: User,
+    b: User,
+    chat: dict[str, Any],
+    message_id: int | None,
+) -> list[OutboundAction]:
+    """Re-render the tapped sheet against the truth (edit in place, best-effort)."""
+    if message_id is None:
+        return []
+    text, markup = await sheet_view(session, ledger, a, b)
+    return [EditMessage(chat_id=chat["id"], message_id=message_id, text=text, reply_markup=markup)]
 
 
 def _strip_undone_mark(text: str) -> str:
@@ -324,7 +425,7 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
         runner = _RUNNERS.get(command or "")
         if runner is not None:
             reply = await _run_command(runner, message, session, group, actor)
-            markup = None
+            markup = reply.markup
             board: list[OutboundAction] = []
             if reply.undo_action_id is not None:
                 markup = undo_keyboard(reply.undo_action_id)
@@ -560,6 +661,14 @@ async def _run_settle(
     message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
 ) -> Reply:
     parsed = parse_settle(message["text"])
+    if parsed.amount is None:
+        # the settle sheet (ADR-0007): a read — no lock, no action row (§0.7);
+        # the buttons' WYSIWYG amount tokens guard staleness, not the render
+        pair = await resolve_refs(session, group.id, [parsed.from_ref, parsed.to_ref], actor)
+        ledger = await session.get_one(Ledger, group.active_ledger_id)
+        text, markup = await sheet_view(session, ledger, pair[parsed.from_ref], pair[parsed.to_ref])
+        return Reply(text=text, markup=markup)
+    assert parsed.currency is not None
     # the currency is explicit on /settle (§4): no active-ledger resolution, so
     # minor-unit conversion can happen before the lock. It also runs before apply's
     # recognized-currency check (ADR-0009) — same accepted ordering as _run_expense

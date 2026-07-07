@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from expensir.domain.money import fmt
+from expensir.format.board import BoardLine
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,19 @@ def settle_reply(
     amount = fmt(amount_minor, currency)
     rounded = f" (rounded from {rounded_from})" if rounded_from is not None else ""
     return f"📒 {ledger_name} • 🤝 {from_name} paid {to_name} {amount}{rounded}. Balances updated."
+
+
+def settle_sheet_reply(
+    *,
+    ledger_name: str,
+    pair_names: tuple[str, str],  # the UNORDERED pair (ADR-0007), in stable order
+    transfers: list[BoardLine],
+) -> str:
+    first, second = pair_names
+    if not transfers:
+        return f"📒 {ledger_name} • Nothing to settle between {first} and {second}."
+    lines = (f"{t.from_name} → {t.to_name} {fmt(t.amount_minor, t.currency)}" for t in transfers)
+    return "\n".join([f"📒 {ledger_name} • Settling up {first} ↔ {second}", *lines])
 
 
 def delete_reply(

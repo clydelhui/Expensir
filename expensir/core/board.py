@@ -68,14 +68,16 @@ async def sync_board(
     ]
 
 
-async def _board_view(session: AsyncSession, ledger: Ledger) -> tuple[str, InlineKeyboard | None]:
-    net = await net_positions(session, ledger.id)
+async def suggested_transfers(session: AsyncSession, ledger_id: int) -> list[BoardLine]:
+    """Union over currencies of simplify's transfers, in stable order (§7.4) —
+    the board shows them all, the settle sheet filters to one pair (ADR-0007)."""
+    net = await net_positions(session, ledger_id)
     by_currency: dict[str, dict[int, int]] = {}
     for user_id, currencies in net.items():
         for currency, minor in currencies.items():
             by_currency.setdefault(currency, {})[user_id] = minor
     names = await display_names(session, list(net))
-    transfers = [
+    return [
         BoardLine(
             from_id=debtor,
             to_id=creditor,
@@ -87,6 +89,10 @@ async def _board_view(session: AsyncSession, ledger: Ledger) -> tuple[str, Inlin
         for currency in sorted(by_currency)
         for debtor, creditor, minor in simplify(by_currency[currency])
     ]
+
+
+async def _board_view(session: AsyncSession, ledger: Ledger) -> tuple[str, InlineKeyboard | None]:
+    transfers = await suggested_transfers(session, ledger.id)
     return board_text(ledger_name=ledger.name, transfers=transfers), board_keyboard(transfers)
 
 
