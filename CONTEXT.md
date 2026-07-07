@@ -1,6 +1,6 @@
 # Expensir
 
-A self-hostable Telegram bot for Splitwise-style expense splitting inside group chats. This glossary fixes the domain language; implementation lives in ARCHITECTURE.md.
+A self-hostable Telegram bot for Splitwise-style expense splitting inside group chats. This glossary fixes the domain language; implementation lives in ARCHITECTURE-v2.md.
 
 ## Language
 

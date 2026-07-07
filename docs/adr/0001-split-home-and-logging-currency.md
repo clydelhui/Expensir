@@ -12,7 +12,7 @@ The original spec made `groups.default_currency` serve two duties at once: the d
 
 Separate the two duties into two concepts:
 
-- **Home currency** — group-level (`groups.default_currency`), the `≈` display target. Set by `/homecurrency <ISO>` → `set_home_currency` intent. Rare; usually set once at onboarding.
+- **Home currency** — group-level (`groups.home_currency`), the `≈` display target. Set by `/homecurrency <ISO>` → `set_home_currency` intent. Rare; usually set once at onboarding.
 - **Logging currency** — ledger-level, the default currency for new expenses in that ledger. Set by `/currency <ISO>` → `set_logging_currency` intent, or as an optional trailing ISO on `/newledger <name> [ISO]`. A ledger's logging currency is nullable and resolves to the group home currency when unset.
 
 Per-expense currency override is unchanged. The `≈` equivalent and `/convert` still target the home currency only; FX remains display-only.

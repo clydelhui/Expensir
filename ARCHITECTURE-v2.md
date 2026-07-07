@@ -846,7 +846,8 @@ Deploy: run Alembic migrations + `setWebhook` as a one-shot release step, not on
 5. **Slash expense path (no LLM).** `/add`, `/equal`, `/exact`, `/shares`, `/percent`, `/balance`,
    `/settle` (sheet + custom), `/currency`, `/homecurrency`. `setMyCommands`. *Done when:*
    `/equal 60 dinner @A @B` splits correctly and `/balance` reads it back; bare `/add` shows
-   split-type buttons → member picker.
+   split-type buttons → member picker. *(As built, `/add`'s guided button flow and `setMyCommands`
+   were deferred out of this slice — both still open.)*
 6. **Allocation + balances + simplify (pure).** *Done when:* golden tests pass — 3-way $10.00 →
    334/333/333 cents; JPY ¥6001 → 2001/2000/2000; every share a whole minor unit; `sum(owed)==total`;
    the member receiving the extra unit varies with the seed (rotation, ADR-0008) but is stable for a
