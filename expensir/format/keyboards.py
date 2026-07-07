@@ -53,5 +53,17 @@ def sheet_keyboard(ledger_id: int, transfers: list[BoardLine]) -> InlineKeyboard
     }
 
 
+def confirm_keyboard(pending_id: int) -> InlineKeyboard:
+    """Confirm/Cancel on a proposal (§10), keyed by the pending row's id."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Confirm", "callback_data": f"v1:confirm:{pending_id}"},
+                {"text": "✖ Cancel", "callback_data": f"v1:cancel:{pending_id}"},
+            ]
+        ]
+    }
+
+
 def redo_keyboard(action_id: int) -> InlineKeyboard:
     return {"inline_keyboard": [[{"text": "↪️ Redo", "callback_data": f"v1:redo:{action_id}"}]]}

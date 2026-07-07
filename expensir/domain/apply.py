@@ -43,6 +43,21 @@ class ApplyContext:
     actor: User | None
     seed: int  # originating platform message id; drives the rotating tie-break (§7.1)
     source: str = "command"  # 'command' | 'nl' | 'ocr'
+    # a confirmed proposal targets its PINNED ledger, not the current active one
+    # (§10 WYSIWYG); None = the active ledger, as every direct command does
+    ledger_id: int | None = None
+    # whom "me" resolves to: the PROPOSER of a confirmed proposal, whoever pressed
+    # Confirm (issue #13 grill); None = the actor, as on the direct paths
+    me: User | None = None
+
+    def target_ledger_id(self) -> int:
+        if self.ledger_id is not None:
+            return self.ledger_id
+        assert self.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+        return self.group.active_ledger_id
+
+    def me_user(self) -> User | None:
+        return self.me if self.me is not None else self.actor
 
 
 @dataclass
@@ -148,18 +163,15 @@ async def _apply_add_expense(intent: AddExpense, ctx: ApplyContext) -> AppliedEx
     require_known_currency(intent.currency)
 
     refs = [intent.payer_ref] + [p.user_ref for p in intent.participants]
-    resolved = await resolve_refs(ctx.session, ctx.group.id, refs, actor)
+    resolved = await resolve_refs(ctx.session, ctx.group.id, refs, ctx.me_user())
     payer = resolved[intent.payer_ref]
-    participants = _unique([resolved[p.user_ref] for p in intent.participants])
-    if not participants:
-        participants = await registered_members(ctx.session, ctx.group.id)
+    participants = await expense_participants(intent, resolved, ctx.session, ctx.group.id)
 
-    shares = _split(intent, resolved, participants, ctx.seed)
+    shares = split_shares(intent, resolved, participants, ctx.seed)
 
     action = await _append_action(ctx, intent)
-    assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
     expense = Expense(
-        ledger_id=ctx.group.active_ledger_id,
+        ledger_id=ctx.target_ledger_id(),
         payer_id=payer.id,
         amount_minor=intent.amount_minor,
         currency=intent.currency,
@@ -204,17 +216,16 @@ async def _apply_settle_up(intent: SettleUp, ctx: ApplyContext) -> AppliedSettle
         raise Rejection("🤷 A settlement needs a positive amount — nothing was recorded.")
 
     resolved = await resolve_refs(
-        ctx.session, ctx.group.id, [intent.from_ref, intent.to_ref], actor
+        ctx.session, ctx.group.id, [intent.from_ref, intent.to_ref], ctx.me_user()
     )
     payer, receiver = resolved[intent.from_ref], resolved[intent.to_ref]
     if payer.id == receiver.id:
         # compared on resolved ids: "me" and the speaker's @handle are one person
         raise Rejection("🤷 A payment to yourself changes nothing — nothing was recorded.")
 
-    assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
     recorded = await record_settlement(
         ctx.session,
-        ledger_id=ctx.group.active_ledger_id,
+        ledger_id=ctx.target_ledger_id(),
         actor=actor,
         payer=payer,
         receiver=receiver,
@@ -229,10 +240,26 @@ async def _apply_settle_up(intent: SettleUp, ctx: ApplyContext) -> AppliedSettle
     )
 
 
-def _split(
+async def expense_participants(
+    intent: AddExpense, resolved: dict[str, User], session: AsyncSession, group_id: int
+) -> list[User]:
+    """The members a split actually uses: named ones deduped, none -> everyone (§17).
+
+    Public for the same reason as split_shares: the proposal preview (§10) must
+    name EXACTLY the people the confirm will commit (WYSIWYG)."""
+    participants = _unique([resolved[p.user_ref] for p in intent.participants])
+    if not participants:
+        participants = await registered_members(session, group_id)
+    return participants
+
+
+def split_shares(
     intent: AddExpense, resolved: dict[str, User], participants: list[User], seed: int
 ) -> dict[int, int]:
-    """Per-user minor-unit shares — validation by split type BEFORE allocate (§7.1)."""
+    """Per-user minor-unit shares — validation by split type BEFORE allocate (§7.1).
+
+    Public because the proposal preview (§10) must show EXACTLY the shares that
+    commit: one function computes both (WYSIWYG, frozen seed)."""
     currency = intent.currency or ""
     if intent.split_type == "exact":
         shares = {u: int(v) for u, v in _per_user(intent, resolved, "exact_minor").items()}
@@ -329,7 +356,7 @@ async def _sealed_expense(expense_id: int, ctx: ApplyContext) -> Expense:
     ledger = await ctx.session.get_one(Ledger, expense.ledger_id)
     if ledger.group_id != ctx.group.id:
         raise not_found
-    if expense.ledger_id != ctx.group.active_ledger_id:
+    if expense.ledger_id != ctx.target_ledger_id():
         raise Rejection(
             f"🔒 #{expense_id} is in 📒 {ledger.name} — switch there first, then try again."
         )
@@ -483,8 +510,7 @@ async def _append_action(
 ) -> Action:
     actor = _require_actor(ctx)
     if ledger_id is None:
-        assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
-        ledger_id = ctx.group.active_ledger_id
+        ledger_id = ctx.target_ledger_id()
     action = Action(
         ledger_id=ledger_id,
         actor_user_id=actor.id,

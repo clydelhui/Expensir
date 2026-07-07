@@ -5,9 +5,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
+from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expensir.core import pending as pending_store
 from expensir.core.board import BoardMessenger, sync_board
 from expensir.core.locking import per_group_lock
 from expensir.core.outbound import (
@@ -18,8 +20,9 @@ from expensir.core.outbound import (
     SendMessage,
 )
 from expensir.core.sheet import sheet_view
-from expensir.db.models import Action, Group, Ledger, User
+from expensir.db.models import Action, Group, Ledger, PendingIntent, User
 from expensir.domain.apply import (
+    Applied,
     AppliedExpense,
     AppliedExpenseChange,
     AppliedLedgerOp,
@@ -27,6 +30,8 @@ from expensir.domain.apply import (
     AppliedSetup,
     ApplyContext,
     apply_intent,
+    expense_participants,
+    split_shares,
 )
 from expensir.domain.balances import net_positions
 from expensir.domain.currency import resolve_currency
@@ -39,20 +44,29 @@ from expensir.domain.identity import (
     resolve_expense_id,
     resolve_refs,
 )
-from expensir.domain.ledgers import ledgers_of
-from expensir.domain.money import to_minor
+from expensir.domain.ledgers import find_ledger, ledgers_of
+from expensir.domain.money import fmt, to_minor
 from expensir.domain.settle import record_settlement, suggested_amount
 from expensir.domain.undo import ToggleDirection, toggle
-from expensir.format.keyboards import InlineKeyboard, redo_keyboard, undo_keyboard
+from expensir.format.keyboards import (
+    InlineKeyboard,
+    confirm_keyboard,
+    redo_keyboard,
+    undo_keyboard,
+)
 from expensir.format.render import (
     LedgerLine,
+    action_proposal_reply,
     balance_reply,
     delete_reply,
     edit_reply,
     expense_reply,
+    join_names,
     ledgers_reply,
+    proposal_reply,
     settle_reply,
 )
+from expensir.intents import nl
 from expensir.intents.commands import (
     DELETE_USAGE,
     EDIT_USAGE,
@@ -77,6 +91,7 @@ from expensir.intents.schema import (
     ArchiveLedger,
     DeleteExpense,
     EditExpense,
+    Intent,
     NewLedger,
     SetHomeCurrency,
     SetLoggingCurrency,
@@ -87,19 +102,28 @@ from expensir.intents.schema import (
     SplitMember,
     SwitchLedger,
     UnarchiveLedger,
+    Unknown,
 )
+from expensir.llm.base import LLMClient, LLMUnavailable
+from expensir.llm.wire import WireDeleteExpense, WireEditExpense, WireSetup, WireUndoRedo
 
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
+# Confirm/Cancel on a proposal (§10), keyed by the pending row's id
+_CONFIRM_DATA = re.compile(r"^v1:(confirm|cancel):(\d+)$")
 # the board [Settle] button (ADR-0006): tuple + shown amount as a staleness token
 _SETTLE_DATA = re.compile(r"^v1:st:(\d+):(\d+):([A-Z]{3}):(\d+)$")
 # a settle-sheet line (ADR-0007): same tuple + token, prefixed with the ledger —
 # a sheet message is not the pinned board, so the tap can't resolve it from the chat
 _SHEET_DATA = re.compile(r"^v1:sh:(\d+):(\d+):(\d+):([A-Z]{3}):(\d+)$")
-_UNDO_WORDS = re.compile(r"\b(undo|undid|redo)\b", re.IGNORECASE)
-_MENTION = re.compile(r"@\w+")
+_INTENT: TypeAdapter[Intent] = TypeAdapter(Intent)
 UNDONE_MARK = "\n\n↩️ Undone by "
 UNDO_POINTER = (
     "I never undo from chat — tap the ↩️ Undo button on the message that recorded it instead."
+)
+SETUP_GUIDANCE = (
+    "👥 To register someone who hasn't spoken yet, reply to one of their "
+    "messages with /setup, or mention them by tapping their name so the "
+    "mention links their account. A bare @username isn't enough."
 )
 
 
@@ -142,6 +166,9 @@ class Deps:
     # board creation sends inside the locked transaction (ADR-0003); None (tests
     # without one) skips creation, and the next mutation with a client retries
     client: BoardMessenger | None = None
+    # the NL extractor (§12, ADR-0010); None (unconfigured) leaves mentions unanswered
+    llm: LLMClient | None = None
+    pending_ttl_minutes: int = 15  # proposal TTL (§10, §17)
 
 
 async def dispatch(update: dict[str, Any], deps: Deps) -> list[OutboundAction]:
@@ -163,6 +190,9 @@ async def dispatch(update: dict[str, Any], deps: Deps) -> list[OutboundAction]:
 async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[OutboundAction]:
     """Undo/redo (§9) and board [Settle] (ADR-0006) button presses."""
     ack = AnswerCallbackQuery(callback_query_id=callback["id"])
+    confirm = _CONFIRM_DATA.match(callback.get("data") or "")
+    if confirm is not None:
+        return await _handle_confirm_tap(callback, confirm, deps)
     settle = _SETTLE_DATA.match(callback.get("data") or "")
     if settle is not None:
         return await _handle_settle_tap(callback, settle, deps)
@@ -224,6 +254,249 @@ async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[O
         chat_id=chat["id"], message_id=message["message_id"], text=text, reply_markup=markup
     )
     return [ack, edit, *board]
+
+
+async def _handle_confirm_tap(
+    callback: dict[str, Any], match: re.Match[str], deps: Deps
+) -> list[OutboundAction]:
+    """Confirm/Cancel on a proposal (§10): confirm re-resolves + re-validates the
+    UNRESOLVED intent against the PINNED ledger under the lock, applies, and
+    consumes the row — a double-tap finds nothing."""
+    ack = AnswerCallbackQuery(callback_query_id=callback["id"])
+    verb, pending_id = match.group(1), int(match.group(2))
+
+    message = callback.get("message") or {}
+    chat = message.get("chat")
+    if chat is None or chat["type"] not in ("group", "supergroup"):
+        return [ack]
+
+    async with deps.session_factory() as session, session.begin():
+        group = await ensure_group(session, chat["id"], chat.get("title"))
+        presser = await _register_author(session, group.id, callback["from"])
+        if presser is None:
+            ack.text = "I can't tell who pressed that — anonymous admins can't confirm."
+            return [ack]
+        pending = await session.get(PendingIntent, pending_id)
+        if pending is None or pending.chat_id != chat["id"]:
+            # consumed (double-tap) or a forged id: either way, nothing to do
+            ack.text = "This proposal was already handled."
+            return [ack]
+
+        if pending_store.is_expired(pending):
+            # expiry is computed on read (§10): consume and mark; a reply to the
+            # dead proposal starts a fresh NL intent (slice 13)
+            await session.delete(pending)
+            ack.text = "Nothing was recorded."
+            edit = EditMessage(
+                chat_id=chat["id"],
+                message_id=message["message_id"],
+                text="⌛ Expired — nothing was recorded. Send it again if it still applies.",
+            )
+            return [ack, edit]
+
+        if verb == "cancel":
+            # drop the row and mark the message; nothing was ever created (§10)
+            await session.delete(pending)
+            ack.text = "Cancelled."
+            edit = EditMessage(
+                chat_id=chat["id"],
+                message_id=message["message_id"],
+                text="✖ Cancelled — nothing was recorded.",
+            )
+            return [ack, edit]
+
+        # the intent commits to the ledger PINNED at propose time (§10): take the
+        # lock, then re-resolve + re-validate against it — a concurrent /switch
+        # never redirects a pending proposal
+        await per_group_lock(session, group.id)
+        await session.refresh(group)
+        ledger = await session.get_one(Ledger, pending.ledger_id)
+        assert ledger.group_id == group.id  # pinned at propose time, same group
+        if ledger.status != "open":
+            # re-validation failure (§10): the pinned ledger closed meanwhile.
+            # Consume the row — a reply to the dead proposal starts fresh.
+            await session.delete(pending)
+            ack.text = "Nothing was recorded."
+            edit = EditMessage(
+                chat_id=chat["id"],
+                message_id=message["message_id"],
+                text=(
+                    f"⚠️ That changed while you were deciding — 📒 {ledger.name} was "
+                    "archived, so nothing was recorded. Unarchive it and resend if "
+                    "it still applies."
+                ),
+            )
+            return [ack, edit]
+        intent = _INTENT.validate_python(pending.intent_json)
+        proposer = await session.get_one(User, pending.proposer_user_id)
+        ctx = ApplyContext(
+            session=session,
+            group=group,
+            actor=presser,
+            seed=pending.seed,
+            source="nl",
+            ledger_id=pending.ledger_id,
+            me=proposer,
+        )
+        try:
+            # savepoint: a failed re-validation rolls back apply's partial writes
+            # while the consume + registration above still commit (§0.9)
+            async with session.begin_nested():
+                applied = await apply_intent(intent, ctx)
+        except Rejection as exc:
+            await session.delete(pending)  # consumed: a reply starts fresh (§10.4)
+            ack.text = "Nothing was recorded."
+            edit = EditMessage(
+                chat_id=chat["id"],
+                message_id=message["message_id"],
+                text=f"⚠️ That changed while you were deciding — nothing was recorded. {exc}",
+            )
+            return [ack, edit]
+        assert applied is not None
+        await session.delete(pending)  # consume: a second tap finds nothing (§10)
+        if isinstance(applied, AppliedSetup):
+            # registration is permanent (§8): no Undo affordance on the result
+            text = "\n".join(_setup_member_lines(applied))
+            markup = None
+            action_id = applied.action_id  # None when nothing actually registered
+        else:
+            text = _committed_text(intent, applied, pinned_ledger_name=ledger.name)
+            markup = undo_keyboard(applied.action_id)
+            action_id = applied.action_id
+        board: list[OutboundAction] = []
+        if action_id is not None:
+            # the proposal message IS the result message: record it in-transaction
+            # so undo can edit it and reply-to-target can resolve it (§8)
+            action = await session.get_one(Action, action_id)
+            action.result_chat_id = chat["id"]
+            action.result_message_id = message.get("message_id")
+            if action.ledger_id is not None:
+                # every mutation re-renders its ledger's board, like the slash path (§13)
+                board = await sync_board(session, group, action.ledger_id, deps.client)
+
+    ack.text = "✅ Recorded."
+    edit = EditMessage(
+        chat_id=chat["id"],
+        message_id=message["message_id"],
+        text=text,
+        reply_markup=markup,
+    )
+    return [ack, edit, *board]
+
+
+def _committed_text(intent: Intent, applied: Applied, *, pinned_ledger_name: str) -> str:
+    """The committed result a confirmed proposal's message edits into (§10) —
+    the same renders the slash paths use (§4: one contract, one look)."""
+    if isinstance(intent, AddExpense):
+        assert isinstance(applied, AppliedExpense) and intent.currency is not None
+        return expense_reply(
+            ledger_name=pinned_ledger_name,
+            expense_id=applied.expense_id,
+            amount_minor=intent.amount_minor,
+            currency=intent.currency,
+            description=intent.description,
+            payer_name=applied.payer.display_name,
+            participant_names=[u.display_name for u in applied.participants],
+            split_type=intent.split_type,
+            shares=[(u.display_name, applied.shares[u.id]) for u in applied.participants],
+        )
+    if isinstance(intent, SettleUp):
+        assert isinstance(applied, AppliedSettlement)
+        return settle_reply(
+            ledger_name=pinned_ledger_name,
+            from_name=applied.from_user.display_name,
+            to_name=applied.to_user.display_name,
+            amount_minor=applied.amount_minor,
+            currency=applied.currency,
+        )
+    if isinstance(intent, DeleteExpense):
+        assert isinstance(applied, AppliedExpenseChange)
+        return delete_reply(
+            ledger_name=pinned_ledger_name,
+            expense_id=applied.expense.id,
+            amount_minor=applied.expense.amount_minor,
+            currency=applied.expense.currency,
+            description=applied.expense.description,
+        )
+    if isinstance(intent, EditExpense):
+        assert isinstance(applied, AppliedExpenseChange)
+        return edit_reply(
+            ledger_name=pinned_ledger_name,
+            expense_id=applied.expense.id,
+            amount_minor=applied.expense.amount_minor,
+            currency=applied.expense.currency,
+            description=applied.expense.description,
+            occurred_on=applied.expense.occurred_on,
+        )
+    if isinstance(intent, SwitchLedger):
+        assert isinstance(applied, AppliedLedgerOp)
+        return _switch_text(applied.ledger.name)
+    if isinstance(intent, NewLedger):
+        assert isinstance(applied, AppliedLedgerOp)
+        return _new_ledger_text(applied.ledger.name, intent.logging_currency)
+    if isinstance(intent, ArchiveLedger):
+        assert isinstance(applied, AppliedLedgerOp)
+        return _archive_text(applied)
+    if isinstance(intent, UnarchiveLedger):
+        assert isinstance(applied, AppliedLedgerOp)
+        return _unarchive_text(applied.ledger.name)
+    if isinstance(intent, SetHomeCurrency):
+        return _home_currency_text(intent.currency)
+    if isinstance(intent, SetLoggingCurrency):
+        assert isinstance(applied, AppliedLedgerOp)
+        return _logging_currency_text(applied.ledger.name, intent.currency)
+    raise AssertionError(f"unrendered confirmed kind: {intent.kind}")
+
+
+def _switch_text(name: str) -> str:
+    return f"📒 Switched to {name} — new expenses land here."
+
+
+def _new_ledger_text(name: str, logging_currency: str | None) -> str:
+    logging = f" Logging currency: {logging_currency}." if logging_currency is not None else ""
+    return f"📒 {name} is now the active ledger — new expenses land here.{logging}"
+
+
+def _archive_text(applied: AppliedLedgerOp) -> str:
+    text = f"📦 Archived 📒 {applied.ledger.name}."
+    if applied.outstanding_balances:
+        text += " ⚠️ It still has outstanding balances — they stay as they are."
+    if applied.repointed_to is not None:
+        text += f" 📒 {applied.repointed_to.name} is now the active ledger."
+    return text
+
+
+def _unarchive_text(name: str) -> str:
+    return f"📂 Reopened 📒 {name} — it's not active; /switch {name} to log expenses there."
+
+
+def _home_currency_text(currency: str) -> str:
+    return (
+        f"🏠 Home currency set to {currency} — "
+        f"other currencies will show a ≈ {currency} equivalent."
+    )
+
+
+def _logging_currency_text(ledger_name: str, currency: str) -> str:
+    return (
+        f"📒 {ledger_name} now logs in {currency} — new expenses default to "
+        f"{currency}; existing ones keep their currency."
+    )
+
+
+def _setup_member_lines(applied: AppliedSetup) -> list[str]:
+    """The per-person outcome lines /setup and a confirmed NL setup share (§11)."""
+    lines = [
+        f"✅ Registered {member.display_name} — they can now appear in expenses and settlements."
+        for member in applied.registered
+    ]
+    lines += [f"👥 {member.display_name} is already a member." for member in applied.already]
+    lines += [
+        f"🚪 {member.display_name} left the group — their balances are kept, and they'll "
+        "be back in once they re-join or send a message here themselves."
+        for member in applied.departed
+    ]
+    return lines
 
 
 async def _handle_settle_tap(
@@ -465,12 +738,243 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
             ]
 
         text = message.get("text", "")
-        if _mentions_bot(text, deps.bot_username) and _is_undo_request(text):
-            # undo/redo is button-only, never honored from NL (§9); this guard
-            # fronts the NL extractor, which arrives in a later slice (§12)
-            return [SendMessage(chat_id=message["chat"]["id"], text=UNDO_POINTER)]
+        if _mentions_bot(text, deps.bot_username) and deps.llm is not None:
+            return await _handle_nl_text(message, session, group, actor, deps)
 
     return []
+
+
+async def _handle_nl_text(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
+) -> list[OutboundAction]:
+    """The NL text path (§12): extract -> propose; nothing commits until Confirm (§0.7).
+
+    The savepoint scopes a rejection's rollback to the NL handling itself, like
+    _run_command: author registration earlier in the transaction still commits."""
+    assert deps.llm is not None
+    chat_id = message["chat"]["id"]
+    stripped = _strip_bot_mention(message.get("text", ""), deps.bot_username)
+    try:
+        wire = await deps.llm.extract_text(stripped)
+    except LLMUnavailable:
+        # a transport failure is NOT the user's sentence (issue #13 grill): say
+        # so plainly rather than asking them to rephrase
+        return [
+            SendMessage(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ I couldn't reach my language model just now — try again in "
+                    "a moment, or use a slash command like /equal or /balance."
+                ),
+            )
+        ]
+    try:
+        async with session.begin_nested():
+            return await _run_nl_intent(wire, message, session, group, actor, deps)
+    except (Rejection, ValueError) as exc:
+        return [SendMessage(chat_id=chat_id, text=str(exc))]
+
+
+async def _run_nl_intent(
+    wire: Any,
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+    deps: Deps,
+) -> list[OutboundAction]:
+    """Route one extracted intent: reads run immediately, mutations propose (§0.7)."""
+    if isinstance(wire, WireUndoRedo):
+        # detected, never honored (§9): the reply stays templated app-side
+        return [SendMessage(chat_id=message["chat"]["id"], text=UNDO_POINTER)]
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    if isinstance(wire, WireDeleteExpense | WireEditExpense):
+        converted = nl.ConvertedIntent(
+            intent=await _resolve_expense_wire(wire, message, session), rounded_from=None
+        )
+    elif isinstance(wire, WireSetup):
+        # targets come from the MESSAGE, not the model (§11): only the reply
+        # target and text_mentions carry account ids
+        targets, _, _ = _setup_entries(message)
+        if not targets:
+            return [SendMessage(chat_id=message["chat"]["id"], text=SETUP_GUIDANCE)]
+        converted = nl.ConvertedIntent(intent=Setup(targets=targets), rounded_from=None)
+    else:
+        converted = nl.to_intent(
+            wire, logging_currency=ledger.logging_currency, home_currency=group.home_currency
+        )
+    intent = converted.intent
+    reply = await _nl_read_reply(intent, session, group, actor)
+    if reply is not None:
+        return [
+            SendMessage(chat_id=message["chat"]["id"], text=reply.text, reply_markup=reply.markup)
+        ]
+    return await _propose(converted, message, session, group, actor, deps, ledger)
+
+
+async def _resolve_expense_wire(
+    wire: Any, message: dict[str, Any], session: AsyncSession
+) -> DeleteExpense | EditExpense:
+    """Pin the expense a NL delete/edit means (§11): reply-to-target primary,
+    a bare #id in the text fallback. Descriptive matching arrives in slice 13."""
+    reply_to = message.get("reply_to_message")
+    expense_id = await resolve_expense_id(
+        session,
+        platform_chat_id=message["chat"]["id"],
+        reply_message_id=reply_to["message_id"] if reply_to is not None else None,
+        explicit_id=wire.expense_id,
+    )
+    if expense_id is None:
+        raise Rejection(
+            "🤷 Which expense? Reply to its result message or give its #id — " 'e.g. "delete #42".'
+        )
+    if isinstance(wire, WireDeleteExpense):
+        return DeleteExpense(expense_id=expense_id)
+    return EditExpense(
+        expense_id=expense_id, description=wire.description, occurred_on=wire.occurred_on
+    )
+
+
+async def _nl_read_reply(
+    intent: Intent, session: AsyncSession, group: Group, actor: User | None
+) -> Reply | None:
+    """Run an NL read/no-op immediately (§0.7); None means the intent is a mutation."""
+    if isinstance(intent, Unknown):
+        return Reply(
+            text=(
+                "🤷 I couldn't make sense of that — try rephrasing, e.g. "
+                '"I paid 40 for dinner, split with Sam".'
+            )
+        )
+    if isinstance(intent, ShowBalance):
+        return await _balance_reply(intent, session, group, actor)
+    if isinstance(intent, SettleUp) and intent.amount_minor is None:
+        return await _sheet_reply(intent, session, group, actor)
+    return None
+
+
+async def _propose(
+    converted: nl.ConvertedIntent,
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+    deps: Deps,
+    ledger: Ledger,
+) -> list[OutboundAction]:
+    """Render a proposal + park the UNRESOLVED intent, pinned to the active ledger (§10).
+
+    Resolution here is a read-only preview: unknown/ambiguous refs reject the
+    whole intent now, but nothing is created until Confirm."""
+    if actor is None:
+        raise Rejection(
+            "I can't tell who sent that — anonymous admins can't record changes. "
+            "Turn off 'Remain anonymous' and try again."
+        )
+    intent = converted.intent
+    seed = message["message_id"]
+    if isinstance(intent, AddExpense):
+        text = await _expense_proposal_text(intent, converted, session, group, actor, ledger, seed)
+    else:
+        summary = await _proposal_summary(intent, session, group, actor)
+        text = action_proposal_reply(ledger_name=ledger.name, summary=summary)
+
+    parked = await pending_store.park(
+        session,
+        chat_id=message["chat"]["id"],
+        ledger_id=ledger.id,
+        proposer=actor,
+        seed=seed,
+        intent=intent,
+        ttl_minutes=deps.pending_ttl_minutes,
+    )
+    return [
+        SendMessage(
+            chat_id=message["chat"]["id"],
+            text=text,
+            reply_markup=confirm_keyboard(parked.id),
+            records_message_for_pending_id=parked.id,
+        )
+    ]
+
+
+async def _expense_proposal_text(
+    intent: AddExpense,
+    converted: nl.ConvertedIntent,
+    session: AsyncSession,
+    group: Group,
+    actor: User,
+    ledger: Ledger,
+    seed: int,
+) -> str:
+    """The WYSIWYG expense preview (§7.1, §10): shares exactly as they'd commit."""
+    assert intent.currency is not None  # concrete after nl.to_intent (§3)
+    refs = [intent.payer_ref] + [p.user_ref for p in intent.participants]
+    resolved = await resolve_refs(session, group.id, refs, actor)
+    participants = await expense_participants(intent, resolved, session, group.id)
+    shares = split_shares(intent, resolved, participants, seed)
+    return proposal_reply(
+        ledger_name=ledger.name,
+        amount_minor=intent.amount_minor,
+        currency=intent.currency,
+        description=intent.description,
+        payer_name=resolved[intent.payer_ref].display_name,
+        shares=[(u.display_name, shares[u.id]) for u in participants],
+        rounded_from=converted.rounded_from,
+    )
+
+
+async def _proposal_summary(
+    intent: Intent, session: AsyncSession, group: Group, actor: User
+) -> str:
+    """One line saying what Confirm will do — refs previewed read-only (§6)."""
+    if isinstance(intent, SettleUp):
+        assert intent.amount_minor is not None and intent.currency is not None  # reads never park
+        pair = await resolve_refs(session, group.id, [intent.from_ref, intent.to_ref], actor)
+        payer, receiver = pair[intent.from_ref], pair[intent.to_ref]
+        return (
+            f"🤝 {payer.display_name} paid {receiver.display_name} "
+            f"{fmt(intent.amount_minor, intent.currency)}."
+        )
+    if isinstance(intent, DeleteExpense):
+        return f"Delete expense #{intent.expense_id}."
+    if isinstance(intent, EditExpense):
+        changes = [
+            f'description → "{intent.description}"' if intent.description is not None else "",
+            f"date → {intent.occurred_on}" if intent.occurred_on is not None else "",
+        ]
+        return f"Edit #{intent.expense_id}: {', '.join(c for c in changes if c)}."
+    if isinstance(intent, SwitchLedger):
+        target = await find_ledger(session, group.id, intent.name_or_id)
+        return f"Switch to 📒 {target.name} — new expenses land there."
+    if isinstance(intent, NewLedger):
+        logging = f" logging in {intent.logging_currency}" if intent.logging_currency else ""
+        return f"Create 📒 {intent.name}{logging} and make it the active ledger."
+    if isinstance(intent, ArchiveLedger):
+        if intent.name_or_id is None:
+            active = await session.get_one(Ledger, group.active_ledger_id)
+            return f"Archive 📒 {active.name} (the active ledger)."
+        target = await find_ledger(session, group.id, intent.name_or_id)
+        return f"Archive 📒 {target.name}."
+    if isinstance(intent, UnarchiveLedger):
+        target = await find_ledger(session, group.id, intent.name_or_id)
+        return f"Reopen 📒 {target.name} (without switching to it)."
+    if isinstance(intent, SetHomeCurrency):
+        return f"Set the group's home currency to {intent.currency}."
+    if isinstance(intent, SetLoggingCurrency):
+        active = await session.get_one(Ledger, group.active_ledger_id)
+        return f"Log 📒 {active.name} in {intent.currency} from now on."
+    if isinstance(intent, Setup):
+        names = join_names([t.display_name for t in intent.targets])
+        return f"Register {names} as members — this is permanent (no Undo)."
+    raise AssertionError(f"unproposable intent kind: {intent.kind}")
+
+
+def _strip_bot_mention(text: str, bot_username: str | None) -> str:
+    """The extractor sees the message minus the addressing '@bot' itself."""
+    if bot_username is None:
+        return text.strip()
+    return re.sub(f"@{re.escape(bot_username)}", "", text, flags=re.IGNORECASE).strip()
 
 
 async def _run_command(
@@ -499,13 +1003,7 @@ async def _run_homecurrency(
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
     applied = await apply_intent(SetHomeCurrency(currency=currency), ctx)
     assert applied is not None
-    return Reply(
-        text=(
-            f"🏠 Home currency set to {currency} — "
-            f"other currencies will show a ≈ {currency} equivalent."
-        ),
-        undo_action_id=applied.action_id,
-    )
+    return Reply(text=_home_currency_text(currency), undo_action_id=applied.action_id)
 
 
 async def _run_currency(
@@ -516,10 +1014,7 @@ async def _run_currency(
     applied = await apply_intent(SetLoggingCurrency(currency=currency), ctx)
     assert isinstance(applied, AppliedLedgerOp)
     return Reply(
-        text=(
-            f"📒 {applied.ledger.name} now logs in {currency} — new expenses default to "
-            f"{currency}; existing ones keep their currency."
-        ),
+        text=_logging_currency_text(applied.ledger.name, currency),
         undo_action_id=applied.action_id,
     )
 
@@ -531,11 +1026,7 @@ async def _run_newledger(
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
     applied = await apply_intent(NewLedger(name=name, logging_currency=currency), ctx)
     assert isinstance(applied, AppliedLedgerOp)
-    logging = f" Logging currency: {currency}." if currency is not None else ""
-    return Reply(
-        text=f"📒 {name} is now the active ledger — new expenses land here.{logging}",
-        undo_action_id=applied.action_id,
-    )
+    return Reply(text=_new_ledger_text(name, currency), undo_action_id=applied.action_id)
 
 
 async def _run_switch(
@@ -545,10 +1036,7 @@ async def _run_switch(
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
     applied = await apply_intent(SwitchLedger(name_or_id=name_or_id), ctx)
     assert isinstance(applied, AppliedLedgerOp)
-    return Reply(
-        text=f"📒 Switched to {applied.ledger.name} — new expenses land here.",
-        undo_action_id=applied.action_id,
-    )
+    return Reply(text=_switch_text(applied.ledger.name), undo_action_id=applied.action_id)
 
 
 async def _run_archive(
@@ -558,12 +1046,7 @@ async def _run_archive(
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
     applied = await apply_intent(ArchiveLedger(name_or_id=name_or_id), ctx)
     assert isinstance(applied, AppliedLedgerOp)
-    text = f"📦 Archived 📒 {applied.ledger.name}."
-    if applied.outstanding_balances:
-        text += " ⚠️ It still has outstanding balances — they stay as they are."
-    if applied.repointed_to is not None:
-        text += f" 📒 {applied.repointed_to.name} is now the active ledger."
-    return Reply(text=text, undo_action_id=applied.action_id)
+    return Reply(text=_archive_text(applied), undo_action_id=applied.action_id)
 
 
 async def _run_unarchive(
@@ -573,11 +1056,7 @@ async def _run_unarchive(
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
     applied = await apply_intent(UnarchiveLedger(name_or_id=name_or_id), ctx)
     assert isinstance(applied, AppliedLedgerOp)
-    name = applied.ledger.name
-    return Reply(
-        text=f"📂 Reopened 📒 {name} — it's not active; /switch {name} to log expenses there.",
-        undo_action_id=applied.action_id,
-    )
+    return Reply(text=_unarchive_text(applied.ledger.name), undo_action_id=applied.action_id)
 
 
 async def _run_ledgers(
@@ -683,12 +1162,8 @@ async def _run_settle(
 ) -> Reply:
     parsed = parse_settle(message["text"])
     if parsed.amount is None:
-        # the settle sheet (ADR-0007): a read — no lock, no action row (§0.7);
-        # the buttons' WYSIWYG amount tokens guard staleness, not the render
-        pair = await resolve_refs(session, group.id, [parsed.from_ref, parsed.to_ref], actor)
-        ledger = await session.get_one(Ledger, group.active_ledger_id)
-        text, markup = await sheet_view(session, ledger, pair[parsed.from_ref], pair[parsed.to_ref])
-        return Reply(text=text, markup=markup)
+        sheet_intent = SettleUp(from_ref=parsed.from_ref, to_ref=parsed.to_ref)
+        return await _sheet_reply(sheet_intent, session, group, actor)
     assert parsed.currency is not None
     # the currency is explicit on /settle (§4): no active-ledger resolution, so
     # minor-unit conversion can happen before the lock. It also runs before apply's
@@ -713,6 +1188,17 @@ async def _run_settle(
         rounded_from=parsed.amount if was_rounded else None,
     )
     return Reply(text=text, undo_action_id=applied.action_id)
+
+
+async def _sheet_reply(
+    intent: SettleUp, session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    """The settle sheet (ADR-0007), shared by /settle and NL: a read — no lock,
+    no action row (§0.7); the buttons' WYSIWYG amount tokens guard staleness."""
+    pair = await resolve_refs(session, group.id, [intent.from_ref, intent.to_ref], actor)
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    text, markup = await sheet_view(session, ledger, pair[intent.from_ref], pair[intent.to_ref])
+    return Reply(text=text, markup=markup)
 
 
 async def _run_delete(
@@ -789,6 +1275,13 @@ async def _run_balance(
     message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
 ) -> Reply:
     intent = ShowBalance(scope=parse_balance(message["text"]))
+    return await _balance_reply(intent, session, group, actor)
+
+
+async def _balance_reply(
+    intent: ShowBalance, session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    """The show_balance read, shared by /balance and NL (§4: one Intent contract)."""
     # a read: no lock, no action row, sealed to the active ledger (§0.7, §0.10, §8)
     ledger = await session.get_one(Ledger, group.active_ledger_id)
     net = await net_positions(session, ledger.id)
@@ -810,32 +1303,14 @@ async def _run_setup(
     Permanent — the Reply never carries an undo_action_id, so no Undo button."""
     targets, bare_usernames, bot_names = _setup_entries(message)
     if not targets and not bare_usernames and not bot_names:
-        return Reply(
-            text=(
-                "👥 To register someone who hasn't spoken yet, reply to one of their "
-                "messages with /setup, or mention them by tapping their name so the "
-                "mention links their account. A bare @username isn't enough."
-            )
-        )
+        return Reply(text=SETUP_GUIDANCE)
 
-    registered: list[User] = []
-    already: list[User] = []
-    departed: list[User] = []
+    lines: list[str] = []
     if targets:
         ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
         applied = await apply_intent(Setup(targets=targets), ctx)
         assert isinstance(applied, AppliedSetup)
-        registered, already, departed = applied.registered, applied.already, applied.departed
-    lines = [
-        f"✅ Registered {member.display_name} — they can now appear in expenses and settlements."
-        for member in registered
-    ]
-    lines += [f"👥 {member.display_name} is already a member." for member in already]
-    lines += [
-        f"🚪 {member.display_name} left the group — their balances are kept, and they'll "
-        "be back in once they re-join or send a message here themselves."
-        for member in departed
-    ]
+        lines = _setup_member_lines(applied)
     lines += [
         f"🚫 {username} can't be added from a bare @username — Telegram doesn't let me "
         "look accounts up by name. They can send a message here once, or someone can "
@@ -934,13 +1409,6 @@ def _is_member(chat_member: dict[str, Any]) -> bool:
     if status == "restricted":
         return bool(chat_member.get("is_member"))
     return status in ("member", "administrator", "creator")
-
-
-def _is_undo_request(text: str) -> bool:
-    """An undo word leading the message (mentions aside) reads as a request;
-    one buried mid-sentence is ordinary prose ("… to redo the paint job")."""
-    words = _MENTION.sub(" ", text).split()
-    return any(_UNDO_WORDS.fullmatch(word.strip(".,!?")) for word in words[:3])
 
 
 def _mentions_bot(text: str, bot_username: str | None) -> bool:

@@ -62,6 +62,35 @@ def expense_reply(
     )
 
 
+def proposal_reply(
+    *,
+    ledger_name: str,
+    amount_minor: int,
+    currency: str,
+    description: str,
+    payer_name: str,
+    shares: list[tuple[str, int]],  # (name, owed minor) — ALWAYS shown: WYSIWYG (§7.1, §10)
+    rounded_from: str | None = None,
+) -> str:
+    """A fuzzy intent awaiting Confirm (§10): summary + per-person shares + footer.
+
+    The 📒 prefix names the PINNED ledger — what you see is where it commits."""
+    amount = fmt(amount_minor, currency)
+    rounded = f" (rounded from {rounded_from})" if rounded_from is not None else ""
+    each = " · ".join(f"{name} {fmt(minor, currency)}" for name, minor in shares)
+    return (
+        f"📒 {ledger_name} • 💡 {description} — {amount}{rounded} paid by {payer_name}\n"
+        f"{each}\n"
+        f"\n"
+        f"↳ reply to correct"
+    )
+
+
+def action_proposal_reply(*, ledger_name: str, summary: str) -> str:
+    """A non-expense proposal (§10): one-line summary, same pin + footer."""
+    return f"📒 {ledger_name} • 💡 {summary}\n\n↳ reply to correct"
+
+
 def settle_reply(
     *,
     ledger_name: str,

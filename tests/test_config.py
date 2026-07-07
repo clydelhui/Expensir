@@ -81,3 +81,37 @@ def test_example_env_file_parses_cleanly_when_filled_minimally(tmp_path, monkeyp
     assert settings.telegram_webhook_secret == "s3cret"
     assert settings.public_url is None
     assert settings.operator_user_id is None
+
+
+def test_llm_settings_follow_adr_0010_and_default_unset(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123:abc")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./expensir.db")
+    # endpoint-shaped, not provider-shaped (ADR-0010); blank env means unset
+    monkeypatch.setenv("LLM_BASE_URL", "")
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("LLM_MODEL", "")
+
+    settings = Settings()
+
+    assert settings.llm_base_url is None
+    assert settings.llm_api_key is None
+    assert settings.llm_model is None
+    assert settings.pending_ttl_minutes == 15  # §17
+
+
+def test_llm_settings_read_the_endpoint_triple(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123:abc")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./expensir.db")
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/acc/ai/v1")
+    monkeypatch.setenv("LLM_API_KEY", "cf-token")
+    monkeypatch.setenv("LLM_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+    monkeypatch.setenv("PENDING_TTL_MINUTES", "5")
+
+    settings = Settings()
+
+    assert settings.llm_base_url.endswith("/ai/v1")
+    assert settings.llm_api_key == "cf-token"
+    assert settings.llm_model == "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    assert settings.pending_ttl_minutes == 5

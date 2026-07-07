@@ -5,7 +5,7 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expensir.core.outbound import OutboundAction
-from expensir.db.models import Action
+from expensir.db.models import Action, PendingIntent
 from expensir.telegram.client import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,12 @@ async def execute(
                     session_factory,
                     action.records_result_for_action_id,
                     chat_id=action.chat_id,
+                    message_id=sent["message_id"],
+                )
+            if action.records_message_for_pending_id is not None and session_factory is not None:
+                await _record_pending_message(
+                    session_factory,
+                    action.records_message_for_pending_id,
                     message_id=sent["message_id"],
                 )
         elif action.kind == "edit_message":
@@ -83,3 +89,16 @@ async def _record_result(
         action = await session.get_one(Action, action_id)
         action.result_chat_id = chat_id
         action.result_message_id = message_id
+
+
+async def _record_pending_message(
+    session_factory: async_sessionmaker[AsyncSession],
+    pending_id: int,
+    message_id: int,
+) -> None:
+    """Key the pending row by its just-sent proposal message (§10). The row may
+    already be gone — a fast Cancel/Confirm wins harmlessly."""
+    async with session_factory() as session, session.begin():
+        pending = await session.get(PendingIntent, pending_id)
+        if pending is not None:
+            pending.message_id = message_id

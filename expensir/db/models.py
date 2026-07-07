@@ -154,6 +154,28 @@ class Settlement(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PendingIntent(Base):
+    """An unresolved proposed intent awaiting Confirm (§10), pinned to the ledger
+    active at propose time — confirm commits THERE, not to the current active
+    ledger (WYSIWYG). Expiry is computed on read; consumed on confirm/cancel."""
+
+    __tablename__ = "pending_intents"
+    __table_args__ = (Index("ix_pending_intents_chat_message", "chat_id", "message_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    # the proposal message's id (§10 reply routing); NULL until the executor's
+    # send reports it back, like actions.result_message_id
+    message_id: Mapped[int | None] = mapped_column(BigInteger)
+    ledger_id: Mapped[int] = mapped_column(ForeignKey("ledgers.id"))
+    # "me" in the stored intent means this member, whoever presses Confirm
+    proposer_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    seed: Mapped[int] = mapped_column(BigInteger)  # frozen: proposed shares == committed (§7.1)
+    intent_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Ledger(Base):
     __tablename__ = "ledgers"
     # create-board-once guard (ADR-0003, §5). Composite because Telegram message ids are

@@ -6,8 +6,10 @@ from sqlalchemy import select
 
 from expensir.core.handler import dispatch
 from expensir.db.models import Action, Expense, Group, utcnow
+from expensir.llm.wire import WireAddExpense, WireUndoRedo
 from expensir.transports.executor import execute
 from tests.factories import bot_added_update, callback_update, message_update, user
+from tests.fakes import FakeLLM
 
 ALICE = user(1001, "Alice", "alice")
 BOB = user(1002, "Bob", "bob")
@@ -336,8 +338,11 @@ async def test_a_failed_telegram_edit_does_not_roll_back_the_undo(deps):
 
 
 async def test_nl_undo_is_never_honored_and_points_to_the_button(deps):
+    # the extractor DETECTS the undo intent (§12, issue #13); the reply stays
+    # templated app-side and nothing is performed (§9)
     await setup_group(deps)
     action, _ = await add_dinner(deps)
+    deps.llm = FakeLLM([WireUndoRedo()])
 
     [reply] = await dispatch(
         message_update(update_id=6, chat_id=-42, text="@expensir_bot undo that", from_user=BOB),
@@ -352,13 +357,16 @@ async def test_nl_undo_is_never_honored_and_points_to_the_button(deps):
         assert refreshed.undone_at is None
 
 
-async def test_a_mention_merely_containing_an_undo_word_is_not_treated_as_an_undo_request(deps):
+async def test_a_mention_merely_containing_an_undo_word_is_an_expense_not_an_undo(deps):
     await setup_group(deps)
     await add_dinner(deps)
 
-    # "redo" here is part of the expense description, not an undo/redo request —
-    # the pointer must not steal messages meant for the NL extractor (§12)
-    outbound = await dispatch(
+    # "redo" here is part of the expense description: the extractor maps it to
+    # an expense, which proposes like any NL mutation (§10, §12) — not a pointer
+    deps.llm = FakeLLM(
+        [WireAddExpense(amount="30", currency="EUR", description="redo the paint job")]
+    )
+    [proposal] = await dispatch(
         message_update(
             update_id=6,
             chat_id=-42,
@@ -368,12 +376,15 @@ async def test_a_mention_merely_containing_an_undo_word_is_not_treated_as_an_und
         deps,
     )
 
-    assert outbound == []
+    assert "↩️" not in proposal.text
+    assert "redo the paint job" in proposal.text
+    assert "reply to correct" in proposal.text  # a proposal, awaiting Confirm (§10)
 
 
 async def test_a_polite_nl_undo_request_still_gets_the_pointer(deps):
     await setup_group(deps)
     await add_dinner(deps)
+    deps.llm = FakeLLM([WireUndoRedo()])
 
     [reply] = await dispatch(
         message_update(

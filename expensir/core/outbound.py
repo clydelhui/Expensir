@@ -13,6 +13,9 @@ class SendMessage(BaseModel):
     # when set, the executor stores the sent message's chat/message id back onto
     # this actions row so undo can edit it and reply-to-target can resolve it (§8)
     records_result_for_action_id: int | None = None
+    # when set, the executor stores the sent message's id onto this pending_intents
+    # row — the proposal message keys the confirm/reply-to-correct loop (§10)
+    records_message_for_pending_id: int | None = None
 
 
 class EditMessage(BaseModel):

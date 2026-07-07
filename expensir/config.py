@@ -17,8 +17,16 @@ class Settings(BaseSettings):
     operator_user_id: int | None = None
     undo_window_hours: int = 24  # after this, undo/redo is operator-only (§9)
     telegram_api_base: str = "https://api.telegram.org"  # overridable for stub/test servers
+    # the NL extractor endpoint (ADR-0010): any OpenAI-compatible provider —
+    # Cloudflare Workers AI, OpenRouter, DigitalOcean, Groq. Unset = NL disabled.
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str | None = None  # provider-specific id; verify in the dashboard (§1)
+    pending_ttl_minutes: int = 15  # proposal TTL (§10, §17)
 
-    @field_validator("public_url", "operator_user_id", mode="before")
+    @field_validator(
+        "public_url", "operator_user_id", "llm_base_url", "llm_api_key", "llm_model", mode="before"
+    )
     @classmethod
     def _blank_env_value_means_unset(cls, value: object) -> object:
         return None if value == "" else value

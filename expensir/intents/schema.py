@@ -110,6 +110,13 @@ class ShowBalance(BaseModel):
     convert_to: str | None = None  # /convert <TARGET>; arrives with the FX slice
 
 
+class Unknown(BaseModel):
+    """The LLM couldn't map it (§4): a no-op — ask to rephrase, write nothing."""
+
+    kind: Literal["unknown"] = "unknown"
+    reason: str = ""
+
+
 # grows into the full §4 discriminated union as slices add kinds
 Intent = Annotated[
     AddExpense
@@ -123,6 +130,7 @@ Intent = Annotated[
     | ArchiveLedger
     | UnarchiveLedger
     | Setup
-    | ShowBalance,
+    | ShowBalance
+    | Unknown,
     Field(discriminator="kind"),
 ]

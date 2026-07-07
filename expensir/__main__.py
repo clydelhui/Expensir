@@ -8,9 +8,21 @@ import uvicorn
 from expensir.config import Settings
 from expensir.core.handler import Deps
 from expensir.db.session import make_session_factory
+from expensir.llm.base import LLMClient
+from expensir.llm.openai_compat import OpenAICompatLLM
 from expensir.telegram.client import HttpxTelegramClient
 from expensir.transports.poll import run_poll
 from expensir.transports.webhook import create_app
+
+
+def _make_llm(settings: Settings) -> LLMClient | None:
+    """One OpenAI-compatible client, provider chosen by base URL (ADR-0010).
+    Unconfigured -> NL stays off; slash commands are unaffected."""
+    if not (settings.llm_base_url and settings.llm_api_key and settings.llm_model):
+        return None
+    return OpenAICompatLLM(
+        base_url=settings.llm_base_url, api_key=settings.llm_api_key, model=settings.llm_model
+    )
 
 
 def main() -> None:
@@ -23,6 +35,8 @@ def main() -> None:
         operator_user_id=settings.operator_user_id,
         undo_window_hours=settings.undo_window_hours,
         client=telegram,  # board creation sends inside the locked transaction (ADR-0003)
+        llm=_make_llm(settings),
+        pending_ttl_minutes=settings.pending_ttl_minutes,
     )
 
     if settings.mode == "poll":

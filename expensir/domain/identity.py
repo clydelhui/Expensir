@@ -56,7 +56,7 @@ async def resolve_refs(
         if ref == "me" and actor is not None:
             resolved[ref] = actor
             continue
-        member = await _member_by_username(session, group_id, ref.removeprefix("@"))
+        member = await _member_by_ref(session, group_id, ref)
         if member is None:
             unknown.append(ref)
         else:
@@ -74,8 +74,26 @@ def join_refs(refs: list[str]) -> str:
     return ", ".join(ref if ref.startswith("@") else f"@{ref}" for ref in refs)
 
 
-async def _member_by_username(session: AsyncSession, group_id: int, username: str) -> User | None:
-    members = list(
+async def _member_by_ref(session: AsyncSession, group_id: int, ref: str) -> User | None:
+    """One current member for a reference (§11): '@username' matches exactly; a
+    bare name (NL) also matches display names — full name or first name,
+    case-insensitive. Ambiguity rejects; the pick-list arrives in slice 13."""
+    matches = {u.id: u for u in await _members_by_username(session, group_id, ref.lstrip("@"))}
+    if not ref.startswith("@"):
+        for member in await _members_by_display_name(session, group_id, ref):
+            matches[member.id] = member
+    if len(matches) > 1:
+        # stale stored usernames can collide, and given names repeat; stopgap
+        # guidance until the pick-list slice (§10, §13)
+        raise Rejection(
+            f"🤔 More than one member here matches {ref} — use their @username "
+            "so I know who you mean."
+        )
+    return next(iter(matches.values()), None)
+
+
+async def _members_by_username(session: AsyncSession, group_id: int, username: str) -> list[User]:
+    return list(
         (
             await session.execute(
                 select(User)
@@ -90,14 +108,18 @@ async def _member_by_username(session: AsyncSession, group_id: int, username: st
             )
         ).scalars()
     )
-    if len(members) > 1:
-        # Telegram reassigns freed handles and stored usernames can go stale, so two
-        # members may share one; stopgap until the pick-list slice (§10, §13)
-        raise Rejection(
-            f"🤔 More than one member here matches @{username} — I can't tell who you "
-            "mean. Ask them to send a message so I can tell them apart, then try again."
-        )
-    return members[0] if members else None
+
+
+async def _members_by_display_name(session: AsyncSession, group_id: int, name: str) -> list[User]:
+    # groups are small: filter registered members in Python rather than fight
+    # cross-DB first-token SQL
+    wanted = name.lower()
+    return [
+        member
+        for member in await registered_members(session, group_id)
+        if member.display_name.lower() == wanted
+        or member.display_name.lower().split()[:1] == [wanted]
+    ]
 
 
 async def resolve_expense_id(

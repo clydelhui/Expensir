@@ -1,0 +1,585 @@
+[
+  {
+    "name": "add_expense_equal_with_named_participant",
+    "utterance": "I paid 40 for dinner, split with Sam",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"add_expense\", \"payer_ref\": \"me\", \"amount\": \"40\", \"currency\": null, \"description\": \"dinner\", \"split_type\": \"equal\", \"participants\": [{\"user_ref\": \"me\"}, {\"user_ref\": \"Sam\"}], \"confidence\": 0.9}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "add_expense",
+      "amount": "40",
+      "description": "dinner"
+    }
+  },
+  {
+    "name": "add_expense_exact_owed_by_one_person",
+    "utterance": "Bob owes me 15 for the taxi",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"add_expense\", \"payer_ref\": \"me\", \"amount\": \"15\", \"currency\": null, \"description\": \"taxi\", \"split_type\": \"exact\", \"participants\": [{\"user_ref\": \"Bob\", \"exact\": \"15\"}], \"confidence\": 0.85}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "add_expense",
+      "split_type": "exact"
+    }
+  },
+  {
+    "name": "add_expense_explicit_currency_and_percent",
+    "utterance": "I paid 120 SGD for the taxi, 70% me 30% Sam",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"add_expense\", \"payer_ref\": \"me\", \"amount\": \"120\", \"currency\": \"SGD\", \"description\": \"taxi\", \"split_type\": \"percent\", \"participants\": [{\"user_ref\": \"me\", \"percent\": 70.0}, {\"user_ref\": \"Sam\", \"percent\": 30.0}]}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "add_expense",
+      "currency": "SGD",
+      "split_type": "percent"
+    }
+  },
+  {
+    "name": "settle_sheet_no_amount",
+    "utterance": "settle up with Alex",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"settle_up\", \"from_ref\": \"me\", \"to_ref\": \"Alex\", \"amount\": null, \"currency\": null}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "settle_up",
+      "amount": null
+    }
+  },
+  {
+    "name": "settle_custom_with_amount",
+    "utterance": "I paid Alex 30 SGD",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"settle_up\", \"from_ref\": \"me\", \"to_ref\": \"Alex\", \"amount\": \"30\", \"currency\": \"SGD\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "settle_up",
+      "amount": "30",
+      "currency": "SGD"
+    }
+  },
+  {
+    "name": "show_balance_me",
+    "utterance": "what do I owe?",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"show_balance\", \"scope\": \"me\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "show_balance",
+      "scope": "me"
+    }
+  },
+  {
+    "name": "show_balance_convert",
+    "utterance": "convert everything to USD",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"show_balance\", \"scope\": \"group\", \"convert_to\": \"USD\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "show_balance",
+      "convert_to": "USD"
+    }
+  },
+  {
+    "name": "delete_by_visible_id",
+    "utterance": "delete #42",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"delete_expense\", \"expense_id\": 42}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "delete_expense",
+      "expense_id": 42
+    }
+  },
+  {
+    "name": "delete_via_reply_no_id",
+    "utterance": "delete this",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"delete_expense\", \"expense_id\": null}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "delete_expense",
+      "expense_id": null
+    }
+  },
+  {
+    "name": "edit_description",
+    "utterance": "rename #7 to team lunch",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"edit_expense\", \"expense_id\": 7, \"description\": \"team lunch\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "edit_expense",
+      "expense_id": 7,
+      "description": "team lunch"
+    }
+  },
+  {
+    "name": "new_ledger_with_currency",
+    "utterance": "new ledger called Tokyo in JPY",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"new_ledger\", \"name\": \"Tokyo\", \"logging_currency\": \"JPY\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "new_ledger",
+      "name": "Tokyo",
+      "logging_currency": "JPY"
+    }
+  },
+  {
+    "name": "switch_ledger",
+    "utterance": "switch to Japan",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"switch_ledger\", \"name_or_id\": \"Japan\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "switch_ledger",
+      "name_or_id": "Japan"
+    }
+  },
+  {
+    "name": "archive_active_ledger",
+    "utterance": "archive this ledger",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"archive_ledger\", \"name_or_id\": null}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "archive_ledger",
+      "name_or_id": null
+    }
+  },
+  {
+    "name": "unarchive_ledger",
+    "utterance": "reopen the Japan ledger",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"unarchive_ledger\", \"name_or_id\": \"Japan\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "unarchive_ledger",
+      "name_or_id": "Japan"
+    }
+  },
+  {
+    "name": "set_home_currency",
+    "utterance": "set our home currency to euros",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"set_home_currency\", \"currency\": \"EUR\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "set_home_currency",
+      "currency": "EUR"
+    }
+  },
+  {
+    "name": "set_logging_currency",
+    "utterance": "log this ledger in yen",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"set_logging_currency\", \"currency\": \"JPY\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "set_logging_currency",
+      "currency": "JPY"
+    }
+  },
+  {
+    "name": "setup_by_reply",
+    "utterance": "add Carol",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"setup\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "setup"
+    }
+  },
+  {
+    "name": "undo_is_detected_never_honored",
+    "utterance": "undo that",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"undo_redo\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "undo_redo"
+    }
+  },
+  {
+    "name": "unmappable_text",
+    "utterance": "purple monkey dishwasher",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"unknown\", \"reason\": \"not an expense-tracking request\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "unknown"
+    }
+  },
+  {
+    "name": "json_wrapped_in_markdown_fences",
+    "utterance": "I paid 8 for coffee",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "```json\n{\"kind\": \"add_expense\", \"payer_ref\": \"me\", \"amount\": \"8\", \"description\": \"coffee\"}\n```"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "add_expense",
+      "amount": "8",
+      "description": "coffee"
+    }
+  }
+]
