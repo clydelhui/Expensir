@@ -123,6 +123,9 @@ async def _apply_add_expense(intent: AddExpense, ctx: ApplyContext) -> AppliedEx
     # the slash path resolves the currency before building the intent (§3); None is
     # only legal for NL/OCR intents, which are re-resolved at confirm time (later slice)
     assert intent.currency is not None
+    # post-resolution check (ADR-0009): an unrecognized override rejects here, so a
+    # typo'd code corrects instead of minting a balance bucket
+    require_known_currency(intent.currency)
 
     refs = [intent.payer_ref] + [p.user_ref for p in intent.participants]
     resolved = await resolve_refs(ctx.session, ctx.group.id, refs, actor)
@@ -314,6 +317,7 @@ async def _sealed_expense(expense_id: int, ctx: ApplyContext) -> Expense:
 
 
 async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -> AppliedFlip:
+    require_known_currency(intent.currency)  # ADR-0009
     before = {"home_currency": ctx.group.home_currency}
     ctx.group.home_currency = intent.currency
     action = await _append_action(ctx, intent, before_image=before)
@@ -325,6 +329,7 @@ async def _apply_set_logging_currency(
 ) -> AppliedLedgerOp:
     """Change the ACTIVE ledger's new-expense default (ADR-0001); existing expenses keep
     their frozen currency — this is a default-picker, never a re-denomination (§3)."""
+    require_known_currency(intent.currency)  # ADR-0009
     assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
     ledger = await ctx.session.get_one(Ledger, ctx.group.active_ledger_id)
     before = {"logging_currency": ledger.logging_currency}
@@ -335,6 +340,9 @@ async def _apply_set_logging_currency(
 
 async def _apply_new_ledger(intent: NewLedger, ctx: ApplyContext) -> AppliedLedgerOp:
     """Create + activate (§8, ADR-0004): undo restores the previous active pointer."""
+    if intent.logging_currency is not None:
+        # reject loudly (ADR-0009): the trailing token is never folded into the name
+        require_known_currency(intent.logging_currency)
     before = {"active_ledger_id": ctx.group.active_ledger_id}
     ledger = Ledger(
         group_id=ctx.group.id, name=intent.name, logging_currency=intent.logging_currency

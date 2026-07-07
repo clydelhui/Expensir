@@ -35,6 +35,10 @@ _Avoid_: default currency, ledger currency
 **Equivalent** (`≈`):
 The home-currency rendering of an amount that is natively in another currency, computed at today's rate and labelled approximate. Pure display; never stored; shows `(≈ n/a)` when no rate is available.
 
+**Recognized currency**:
+A circulating ISO 4217 code — the only kind of currency any input may introduce, whatever the door (slash command, natural language, receipt photo). Non-circulating codes (gold, SDRs, fund codes, "no currency") are not recognized. Recognition is checked at the input edge only: stored transactions and imported backups keep whatever code they were written with, even one since retired from the standard. Distinct from FX support — a recognized currency may still have no rate and render `(≈ n/a)`.
+_Avoid_: valid currency, supported currency (reserved for FX rate availability)
+
 ### Transactions & balances
 
 **Expense**:

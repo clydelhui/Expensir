@@ -196,8 +196,16 @@ in storage or math; whole-unit-ness is guaranteed by the representation itself (
 sub-unit precision to police).
 
 **Minor digits.** Each ISO currency has a `minor_digits` count (most 2; some 0 or 3). Maintain a
-small table; default unknown codes to 2. It is used **only** to parse a typed major-unit amount and
-to place the decimal point when formatting — it does **not** affect allocation granularity.
+small table; default unknown codes to 2 (stored data may legitimately carry a code retired from the
+standard, ADR-0009). It is used **only** to parse a typed major-unit amount and to place the
+decimal point when formatting — it does **not** affect allocation granularity.
+
+**Validation (ADR-0009).** Every currency **input** must be a **recognized currency** — a
+circulating ISO 4217 code (no XAU/XDR/XXX/fund codes). The check lives at the apply layer as one
+invariant — no currency code crosses `apply_intent` unvalidated — so every door (slash, NL, OCR,
+FX) inherits it. Unknown codes **reject loudly with a correction** and are never re-interpreted as
+ledger-name or description text (§0.9). Inputs only: stored rows, replay, rendering, and imported
+backups are never re-policed.
 
 | `minor_digits` | examples | smallest unit | 1 major unit |
 |---|---|---|---|
@@ -237,9 +245,9 @@ The resolved currency is **frozen onto the expense row at creation** (`expenses.
 changes to logging or home currency **never re-denominate an existing transaction** (§18 non-goal:
 no automatic FX on stored expenses). Logging currency is a default-picker only.
 
-**Per-expense override.** An expense may specify any currency via an ISO code immediately after the
-amount (`/equal 30 SGD trains @a`) or via NL words/symbols. The proposal/result always shows the
-resolved currency so a wrong default is visible.
+**Per-expense override.** An expense may specify any **recognized** currency (ADR-0009) via an ISO
+code immediately after the amount (`/equal 30 SGD trains @a`) or via NL words/symbols. The
+proposal/result always shows the resolved currency so a wrong default is visible.
 
 **`≈` equivalents.** Board lines and balance buckets in a non-home currency show the home-currency
 equivalent, labeled approximate. Whenever the board or a balance is rendered and the cached **API**

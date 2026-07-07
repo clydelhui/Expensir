@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted — amends ARCHITECTURE.md §7.3, which required validating that `from` owes `to` and rejecting with "Nothing to settle in C." Partially amended by ADR-0007: full settle-up as a bulk commit no longer exists — "settle up with X" renders a per-line settle sheet instead.
+accepted — amends ARCHITECTURE.md §7.3, which required validating that `from` owes `to` and rejecting with "Nothing to settle in C." Partially amended by ADR-0007: full settle-up as a bulk commit no longer exists — "settle up with X" renders a per-line settle sheet instead. The "real ISO" check this ADR kept on the custom path is generalized by ADR-0009 to every currency input.
 
 ## Context
 

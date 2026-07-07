@@ -525,6 +525,9 @@ async def _run_expense(
     await session.refresh(group)
     ledger = await session.get_one(Ledger, group.active_ledger_id)
     currency = resolve_currency(parsed.currency, ledger.logging_currency, group.home_currency)
+    # to_minor runs before apply's recognized-currency check (ADR-0009), so an
+    # amount-shaped error can mention an unrecognized code — accepted; don't "fix"
+    # it by validating here, or the NL path stops inheriting the check
     amount_minor, was_rounded = to_minor(parsed.amount, currency)
 
     intent = AddExpense(
@@ -558,7 +561,8 @@ async def _run_settle(
 ) -> Reply:
     parsed = parse_settle(message["text"])
     # the currency is explicit on /settle (§4): no active-ledger resolution, so
-    # minor-unit conversion can happen before the lock
+    # minor-unit conversion can happen before the lock. It also runs before apply's
+    # recognized-currency check (ADR-0009) — same accepted ordering as _run_expense
     amount_minor, was_rounded = to_minor(parsed.amount, parsed.currency)
     intent = SettleUp(
         from_ref=parsed.from_ref,
