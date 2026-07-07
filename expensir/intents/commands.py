@@ -24,6 +24,10 @@ NEWLEDGER_USAGE = "Usage: /newledger <name> [ISO], e.g. /newledger Tokyo JPY"
 SWITCH_USAGE = "Usage: /switch <ledger>, e.g. /switch Tokyo — /ledgers to see them"
 UNARCHIVE_USAGE = "Usage: /unarchive <ledger>, e.g. /unarchive Tokyo — /ledgers to see them"
 CURRENCY_USAGE = "Usage: /currency <ISO>, e.g. /currency JPY"
+SETTLE_USAGE = (
+    "Usage: /settle [@from] @to <amount> <ISO>, e.g. /settle @alice 30 EUR — "
+    "records that @from (you, if omitted) paid @to."
+)
 
 _EXPENSE_ID = re.compile(r"^#?(\d+)$")
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -129,6 +133,33 @@ def _parse_valued_split(
         participant_values=values,
         split_type=split_type,
     )
+
+
+@dataclass
+class ParsedSettle:
+    """The custom settle (§7.3): a directed pair, an amount, an explicit currency."""
+
+    from_ref: str  # "me" when the speaker left themselves implicit
+    to_ref: str
+    amount: str
+    currency: str
+
+
+def parse_settle(text: str) -> ParsedSettle:
+    """'/settle [@from] @to <amount> <ISO>' — the ISO is required: a settlement
+    with an amount never falls back to ledger/home resolution (§4)."""
+    tokens = text.split()[1:]
+    mentions = [t for t in tokens if t.startswith("@")]
+    rest = [t for t in tokens if not t.startswith("@")]
+    if len(mentions) == 1:
+        from_ref, to_ref = "me", mentions[0]
+    elif len(mentions) == 2:
+        from_ref, to_ref = mentions
+    else:
+        raise ValueError(SETTLE_USAGE)
+    if len(rest) != 2 or not _AMOUNT.match(rest[0]) or not _ANY_ISO.match(rest[1]):
+        raise ValueError(SETTLE_USAGE)
+    return ParsedSettle(from_ref=from_ref, to_ref=to_ref, amount=rest[0], currency=rest[1].upper())
 
 
 def parse_balance(text: str) -> Literal["me", "group"]:

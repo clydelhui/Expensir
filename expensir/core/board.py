@@ -22,6 +22,7 @@ from expensir.domain.balances import net_positions
 from expensir.domain.identity import display_names
 from expensir.domain.simplify import simplify
 from expensir.format.board import BoardLine, board_text
+from expensir.format.keyboards import InlineKeyboard, board_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -50,31 +51,43 @@ async def sync_board(
     board is created + pinned inline, right here under the per-group lock.
     """
     ledger = await session.get_one(Ledger, ledger_id)
-    text = await _board_text(session, ledger)
+    text, markup = await _board_view(session, ledger)
     if ledger.board_message_id is None or ledger.board_chat_id is None:
         if ledger.status != "open":
             # a board pins forever (§13 never-delete): never mint one for a ledger
             # this same mutation is retiring (archive, undo of /newledger)
             return []
-        return await _create_board(session, group, ledger, text, messenger)
+        return await _create_board(session, group, ledger, text, markup, messenger)
     return [
-        EditMessage(chat_id=ledger.board_chat_id, message_id=ledger.board_message_id, text=text)
+        EditMessage(
+            chat_id=ledger.board_chat_id,
+            message_id=ledger.board_message_id,
+            text=text,
+            reply_markup=markup,
+        )
     ]
 
 
-async def _board_text(session: AsyncSession, ledger: Ledger) -> str:
+async def _board_view(session: AsyncSession, ledger: Ledger) -> tuple[str, InlineKeyboard | None]:
     net = await net_positions(session, ledger.id)
     by_currency: dict[str, dict[int, int]] = {}
     for user_id, currencies in net.items():
         for currency, minor in currencies.items():
             by_currency.setdefault(currency, {})[user_id] = minor
     names = await display_names(session, list(net))
-    transfers: list[BoardLine] = [
-        (names[debtor], names[creditor], minor, currency)
+    transfers = [
+        BoardLine(
+            from_id=debtor,
+            to_id=creditor,
+            from_name=names[debtor],
+            to_name=names[creditor],
+            amount_minor=minor,
+            currency=currency,
+        )
         for currency in sorted(by_currency)
         for debtor, creditor, minor in simplify(by_currency[currency])
     ]
-    return board_text(ledger_name=ledger.name, transfers=transfers)
+    return board_text(ledger_name=ledger.name, transfers=transfers), board_keyboard(transfers)
 
 
 async def _create_board(
@@ -82,12 +95,15 @@ async def _create_board(
     group: Group,
     ledger: Ledger,
     text: str,
+    markup: InlineKeyboard | None,
     messenger: BoardMessenger | None,
 ) -> list[OutboundAction]:
     if messenger is None:
         return []  # nothing to send with; the next mutation retries creation
     try:
-        sent = await messenger.send_message(chat_id=group.platform_chat_id, text=text)
+        sent = await messenger.send_message(
+            chat_id=group.platform_chat_id, text=text, reply_markup=markup
+        )
     except Exception:
         logger.warning("board create send failed; retrying on the next mutation", exc_info=True)
         return []

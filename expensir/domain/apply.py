@@ -14,10 +14,12 @@ from expensir.core.locking import per_group_lock
 from expensir.db.models import Action, Expense, ExpenseSplit, Group, Ledger, User, utcnow
 from expensir.domain.allocate import allocate
 from expensir.domain.balances import net_positions
+from expensir.domain.currency import require_known_currency
 from expensir.domain.errors import Rejection
 from expensir.domain.identity import registered_members, resolve_refs
 from expensir.domain.ledgers import find_ledger, most_recent_open
 from expensir.domain.money import fmt
+from expensir.domain.settle import record_settlement
 from expensir.intents.schema import (
     AddExpense,
     ArchiveLedger,
@@ -27,6 +29,7 @@ from expensir.intents.schema import (
     NewLedger,
     SetHomeCurrency,
     SetLoggingCurrency,
+    SettleUp,
     SwitchLedger,
     UnarchiveLedger,
 )
@@ -66,6 +69,17 @@ class AppliedExpenseChange:
 
 
 @dataclass
+class AppliedSettlement:
+    """settle_up: the one settlement row this action recorded (ADR-0007)."""
+
+    action_id: int
+    from_user: User
+    to_user: User
+    amount_minor: int
+    currency: str
+
+
+@dataclass
 class AppliedLedgerOp:
     """A ledger lifecycle flip (§8, ADR-0004): the caller renders the announcement."""
 
@@ -75,7 +89,7 @@ class AppliedLedgerOp:
     outstanding_balances: bool = False  # archive warns but proceeds (§17)
 
 
-Applied = AppliedExpense | AppliedFlip | AppliedExpenseChange | AppliedLedgerOp
+Applied = AppliedExpense | AppliedFlip | AppliedExpenseChange | AppliedSettlement | AppliedLedgerOp
 
 
 async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
@@ -83,6 +97,8 @@ async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
     await ctx.session.refresh(ctx.group)  # post-lock re-read (ADR-0003)
     if isinstance(intent, AddExpense):
         return await _apply_add_expense(intent, ctx)
+    if isinstance(intent, SettleUp):
+        return await _apply_settle_up(intent, ctx)
     if isinstance(intent, DeleteExpense):
         return await _apply_delete_expense(intent, ctx)
     if isinstance(intent, EditExpense):
@@ -149,6 +165,44 @@ async def _apply_add_expense(intent: AddExpense, ctx: ApplyContext) -> AppliedEx
         payer=payer,
         participants=participants,
         shares=shares,
+    )
+
+
+async def _apply_settle_up(intent: SettleUp, ctx: ApplyContext) -> AppliedSettlement:
+    """The custom settle path: fully ungated — any direction, overpayment allowed
+    (ADR-0002). Records the stated payment; balance replay absorbs it (§7.2)."""
+    actor = _require_actor(ctx)
+    # the no-amount form is the settle sheet, a READ (ADR-0007, slice 10): it
+    # never reaches apply_intent
+    assert intent.amount_minor is not None and intent.currency is not None
+    currency = require_known_currency(intent.currency)
+    if intent.amount_minor <= 0:
+        # the slash parser already refuses these; this guards the NL path (§12)
+        raise Rejection("🤷 A settlement needs a positive amount — nothing was recorded.")
+
+    resolved = await resolve_refs(
+        ctx.session, ctx.group.id, [intent.from_ref, intent.to_ref], actor
+    )
+    payer, receiver = resolved[intent.from_ref], resolved[intent.to_ref]
+    if payer.id == receiver.id:
+        # compared on resolved ids: "me" and the speaker's @handle are one person
+        raise Rejection("🤷 A payment to yourself changes nothing — nothing was recorded.")
+
+    assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+    recorded = await record_settlement(
+        ctx.session,
+        ledger_id=ctx.group.active_ledger_id,
+        actor=actor,
+        payer=payer,
+        receiver=receiver,
+        intent=intent.model_copy(update={"currency": currency}),
+    )
+    return AppliedSettlement(
+        action_id=recorded.action_id,
+        from_user=payer,
+        to_user=receiver,
+        amount_minor=intent.amount_minor,
+        currency=currency,
     )
 
 

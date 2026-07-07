@@ -61,6 +61,20 @@ def expense_reply(
     )
 
 
+def settle_reply(
+    *,
+    ledger_name: str,
+    from_name: str,
+    to_name: str,
+    amount_minor: int,
+    currency: str,
+    rounded_from: str | None = None,
+) -> str:
+    amount = fmt(amount_minor, currency)
+    rounded = f" (rounded from {rounded_from})" if rounded_from is not None else ""
+    return f"📒 {ledger_name} • 🤝 {from_name} paid {to_name} {amount}{rounded}. Balances updated."
+
+
 def delete_reply(
     *,
     ledger_name: str,

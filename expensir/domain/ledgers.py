@@ -5,7 +5,7 @@ import re
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from expensir.db.models import Expense, Ledger
+from expensir.db.models import Expense, Ledger, Settlement
 from expensir.domain.errors import Rejection
 
 _ID_REF = re.compile(r"^#?(\d+)$")
@@ -23,8 +23,7 @@ async def ledgers_of(session: AsyncSession, group_id: int) -> list[Ledger]:
 
 
 async def has_transactions(session: AsyncSession, ledger_id: int) -> bool:
-    """Any non-deleted expense? Gates undo of new_ledger (ADR-0004).
-    Settlements join this check in their slice."""
+    """Any non-deleted expense or settlement? Gates undo of new_ledger (ADR-0004)."""
     expense = (
         await session.execute(
             select(Expense.id)
@@ -32,7 +31,16 @@ async def has_transactions(session: AsyncSession, ledger_id: int) -> bool:
             .limit(1)
         )
     ).scalar_one_or_none()
-    return expense is not None
+    if expense is not None:
+        return True
+    settlement = (
+        await session.execute(
+            select(Settlement.id)
+            .where(Settlement.ledger_id == ledger_id, Settlement.deleted_at.is_(None))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return settlement is not None
 
 
 async def most_recent_open(

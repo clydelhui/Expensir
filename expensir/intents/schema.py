@@ -24,6 +24,21 @@ class AddExpense(BaseModel):
     confidence: float | None = None  # LLM self-report; COSMETIC ONLY (§0.7)
 
 
+class SettleUp(BaseModel):
+    """A settlement: one currency, one direction, one row, one action (ADR-0007).
+
+    With an amount this is the CUSTOM path: fully ungated — any direction,
+    overpayment allowed (ADR-0002). Without one it is the settle sheet, a read
+    (ADR-0007, slice 10).
+    """
+
+    kind: Literal["settle_up"] = "settle_up"
+    from_ref: str  # without an amount the pair is UNORDERED (ADR-0007)
+    to_ref: str
+    amount_minor: int | None = None  # None -> settle sheet (a READ; slice 10)
+    currency: str | None = None  # required when amount given
+
+
 class DeleteExpense(BaseModel):
     """Soft-delete: flips deleted_at, undoable — 'fixing history' (§4, §8)."""
 
@@ -82,6 +97,7 @@ class ShowBalance(BaseModel):
 # grows into the full §4 discriminated union as slices add kinds
 Intent = Annotated[
     AddExpense
+    | SettleUp
     | DeleteExpense
     | EditExpense
     | SetHomeCurrency

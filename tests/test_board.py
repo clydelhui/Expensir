@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 
 from expensir.core.handler import dispatch
 from expensir.db.models import Action, Expense, Ledger
-from expensir.format.board import board_text
+from expensir.format.board import BoardLine, board_text
 from expensir.transports.executor import execute
 from tests.factories import bot_added_update, callback_update, message_update, user
 
@@ -382,12 +382,23 @@ async def test_undoing_newledger_after_a_failed_board_send_does_not_mint_one(dep
     assert len(messenger.sent) == 1  # only the first ledger's board, from setup
 
 
+def line(from_id: int, to_id: int, from_name: str, to_name: str, minor: int, ccy: str) -> BoardLine:
+    return BoardLine(
+        from_id=from_id,
+        to_id=to_id,
+        from_name=from_name,
+        to_name=to_name,
+        amount_minor=minor,
+        currency=ccy,
+    )
+
+
 def test_board_lists_suggested_transfers_per_currency():
     text = board_text(
         ledger_name="Japan Trip",
         transfers=[
-            ("Alice", "Bob", 6000, "EUR"),
-            ("Carol", "Bob", 500, "JPY"),
+            line(1, 2, "Alice", "Bob", 6000, "EUR"),
+            line(3, 2, "Carol", "Bob", 500, "JPY"),
         ],
     )
 

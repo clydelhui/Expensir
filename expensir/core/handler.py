@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expensir.core.board import BoardMessenger, sync_board
@@ -21,6 +22,7 @@ from expensir.domain.apply import (
     AppliedExpense,
     AppliedExpenseChange,
     AppliedLedgerOp,
+    AppliedSettlement,
     ApplyContext,
     apply_intent,
 )
@@ -35,6 +37,7 @@ from expensir.domain.identity import (
 )
 from expensir.domain.ledgers import ledgers_of
 from expensir.domain.money import to_minor
+from expensir.domain.settle import record_settlement, suggested_amount
 from expensir.domain.undo import ToggleDirection, toggle
 from expensir.format.keyboards import redo_keyboard, undo_keyboard
 from expensir.format.render import (
@@ -44,6 +47,7 @@ from expensir.format.render import (
     edit_reply,
     expense_reply,
     ledgers_reply,
+    settle_reply,
 )
 from expensir.intents.commands import (
     DELETE_USAGE,
@@ -59,6 +63,7 @@ from expensir.intents.commands import (
     parse_homecurrency,
     parse_newledger,
     parse_percent,
+    parse_settle,
     parse_shares,
     parse_switch,
     parse_unarchive,
@@ -71,6 +76,7 @@ from expensir.intents.schema import (
     NewLedger,
     SetHomeCurrency,
     SetLoggingCurrency,
+    SettleUp,
     ShowBalance,
     SplitMember,
     SwitchLedger,
@@ -78,6 +84,8 @@ from expensir.intents.schema import (
 )
 
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
+# the board [Settle] button (ADR-0006): tuple + shown amount as a staleness token
+_SETTLE_DATA = re.compile(r"^v1:st:(\d+):(\d+):([A-Z]{3}):(\d+)$")
 _UNDO_WORDS = re.compile(r"\b(undo|undid|redo)\b", re.IGNORECASE)
 _MENTION = re.compile(r"@\w+")
 UNDONE_MARK = "\n\n↩️ Undone by "
@@ -140,11 +148,14 @@ async def dispatch(update: dict[str, Any], deps: Deps) -> list[OutboundAction]:
 
 
 async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[OutboundAction]:
-    """Undo/redo button presses (§9). More callback namespaces arrive with later slices."""
+    """Undo/redo (§9) and board [Settle] (ADR-0006) button presses."""
     ack = AnswerCallbackQuery(callback_query_id=callback["id"])
+    settle = _SETTLE_DATA.match(callback.get("data") or "")
+    if settle is not None:
+        return await _handle_settle_tap(callback, settle, deps)
     match = _TOGGLE_DATA.match(callback.get("data") or "")
     if match is None:
-        return [ack]  # not a button of this slice; acknowledge so the spinner stops
+        return [ack]  # not a button of any slice so far; acknowledge so the spinner stops
     direction = cast(ToggleDirection, match.group(1))
     action_id = int(match.group(2))
 
@@ -197,6 +208,92 @@ async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[O
         chat_id=chat["id"], message_id=message["message_id"], text=text, reply_markup=markup
     )
     return [ack, edit, *board]
+
+
+async def _handle_settle_tap(
+    callback: dict[str, Any], match: re.Match[str], deps: Deps
+) -> list[OutboundAction]:
+    """A board [Settle] tap (ADR-0006): WYSIWYG under the lock. Fresh records the
+    shown amount; stale warns + refreshes; a gone line answers 'Already settled.'"""
+    ack = AnswerCallbackQuery(callback_query_id=callback["id"])
+    from_id, to_id = int(match.group(1)), int(match.group(2))
+    currency, shown_minor = match.group(3), int(match.group(4))
+
+    message = callback.get("message") or {}
+    chat = message.get("chat")
+    if chat is None or chat["type"] not in ("group", "supergroup"):
+        return [ack]
+
+    async with deps.session_factory() as session, session.begin():
+        group = await ensure_group(session, chat["id"], chat.get("title"))
+        presser = await _register_author(session, group.id, callback["from"])
+        if presser is None:
+            ack.text = "I can't tell who pressed that — anonymous admins can't record settlements."
+            return [ack]
+        # the tapped board names the ledger: taps on an old ledger's board settle
+        # THAT ledger, mirroring how every mutation syncs its own board (§13)
+        ledger = (
+            await session.execute(
+                select(Ledger).where(
+                    Ledger.board_chat_id == chat["id"],
+                    Ledger.board_message_id == message.get("message_id"),
+                )
+            )
+        ).scalar_one_or_none()
+        if ledger is None or ledger.group_id != group.id:
+            ack.text = "That button doesn't match anything I recorded."
+            return [ack]
+
+        # recompute under the lock (ADR-0006): the shown amount is only a token
+        await per_group_lock(session, group.id)
+        await session.refresh(group)
+        net = await net_positions(session, ledger.id)
+        net_ccy = {user_id: by_ccy.get(currency, 0) for user_id, by_ccy in net.items()}
+        current = suggested_amount(net_ccy, from_id, to_id)
+        if current != shown_minor:
+            ack.text = (
+                "Already settled."
+                if current is None
+                else "⚠️ The board was out of date — nothing recorded. Tap again."
+            )
+            board = await sync_board(session, group, ledger.id, deps.client)
+            return [ack, *board]
+
+        # both ids sit in a transfer simplify just proposed, so the rows exist
+        payer = await session.get_one(User, from_id)
+        receiver = await session.get_one(User, to_id)
+        recorded = await record_settlement(
+            session,
+            ledger_id=ledger.id,
+            actor=presser,
+            payer=payer,
+            receiver=receiver,
+            intent=SettleUp(
+                from_ref=payer.display_name,
+                to_ref=receiver.display_name,
+                amount_minor=shown_minor,
+                currency=currency,
+            ),
+        )
+        board = await sync_board(session, group, ledger.id, deps.client)
+        text = settle_reply(
+            ledger_name=ledger.name,
+            from_name=payer.display_name,
+            to_name=receiver.display_name,
+            amount_minor=shown_minor,
+            currency=currency,
+        )
+    ack.text = "🤝 Recorded."
+    return [
+        ack,
+        SendMessage(
+            chat_id=chat["id"],
+            text=text,
+            reply_markup=undo_keyboard(recorded.action_id),
+            records_result_for_action_id=recorded.action_id,
+        ),
+        *board,
+    ]
 
 
 def _strip_undone_mark(text: str) -> str:
@@ -456,6 +553,34 @@ async def _run_expense(
     return Reply(text=text, undo_action_id=applied.action_id)
 
 
+async def _run_settle(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    parsed = parse_settle(message["text"])
+    # the currency is explicit on /settle (§4): no active-ledger resolution, so
+    # minor-unit conversion can happen before the lock
+    amount_minor, was_rounded = to_minor(parsed.amount, parsed.currency)
+    intent = SettleUp(
+        from_ref=parsed.from_ref,
+        to_ref=parsed.to_ref,
+        amount_minor=amount_minor,
+        currency=parsed.currency,
+    )
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(intent, ctx)
+    assert isinstance(applied, AppliedSettlement)
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    text = settle_reply(
+        ledger_name=ledger.name,
+        from_name=applied.from_user.display_name,
+        to_name=applied.to_user.display_name,
+        amount_minor=applied.amount_minor,
+        currency=applied.currency,
+        rounded_from=parsed.amount if was_rounded else None,
+    )
+    return Reply(text=text, undo_action_id=applied.action_id)
+
+
 async def _run_delete(
     message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
 ) -> Reply:
@@ -556,6 +681,7 @@ _RUNNERS: dict[str, CommandRunner] = {
     "shares": _expense_runner(parse_shares),
     "percent": _expense_runner(parse_percent),
     "balance": _run_balance,
+    "settle": _run_settle,
     "delete": _run_delete,
     "edit": _run_edit,
 }

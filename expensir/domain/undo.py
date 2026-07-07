@@ -13,15 +13,28 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from expensir.core.locking import per_group_lock
-from expensir.db.models import Action, Expense, Group, Identity, Ledger, User, utcnow
+from expensir.db.models import (
+    Action,
+    Expense,
+    Group,
+    Identity,
+    Ledger,
+    Settlement,
+    User,
+    utcnow,
+)
 from expensir.domain.errors import Rejection
+from expensir.domain.identity import display_names
 from expensir.domain.ledgers import has_transactions, most_recent_open
+from expensir.domain.money import fmt
+from expensir.domain.settle import overpayment_credits
 
 ToggleDirection = Literal["undo", "redo"]
 
 # grows as slices add undoable kinds (§4); setup is permanent and never listed
 REVERSIBLE_KINDS = {
     "add_expense",
+    "settle_up",
     "delete_expense",
     "edit_expense",
     "set_home_currency",
@@ -89,18 +102,49 @@ async def toggle(
 
     if direction == "redo":
         return ToggleOutcome("Already redone.", False)
+    credits_before = await _credits_if_settled_against(session, action)
     try:
         await _reverse(session, action, group, now)
     except Rejection as refusal:
         return ToggleOutcome(str(refusal), None)
     action.undone_at = now
     action.undone_by = presser.id
+    warning = await _overpayment_warning(session, action, credits_before)
     return ToggleOutcome(
-        "↩️ Undone.",
+        f"↩️ Undone.{warning}",
         True,
         undone_by_name=presser.display_name,
         toggled_ledger_id=action.ledger_id,
     )
+
+
+async def _credits_if_settled_against(session: AsyncSession, action: Action) -> dict[int, int]:
+    """Settlement-explained credits before undoing an expense (§9) — the baseline,
+    so only credits this undo CREATES are warned about, not pre-existing ones."""
+    if action.kind != "add_expense":
+        return {}
+    currency = action.intent_json.get("currency")
+    if not isinstance(currency, str):
+        return {}
+    return await overpayment_credits(session, action.ledger_id, currency)
+
+
+async def _overpayment_warning(
+    session: AsyncSession, action: Action, credits_before: dict[int, int]
+) -> str:
+    """'⚠️ a later settlement now overpays — Bob has a EUR 30.00 credit' (§9)."""
+    if action.kind != "add_expense":
+        return ""
+    currency = action.intent_json.get("currency")
+    if not isinstance(currency, str):
+        return ""
+    credits_after = await overpayment_credits(session, action.ledger_id, currency)
+    grown = {u: c for u, c in credits_after.items() if c > credits_before.get(u, 0)}
+    if not grown:
+        return ""
+    names = await display_names(session, list(grown))
+    listed = ", ".join(f"{names[u]} has a {fmt(c, currency)} credit" for u, c in grown.items())
+    return f" ⚠️ a later settlement now overpays — {listed}."
 
 
 def _locked(action: Action, now: datetime, window_hours: int) -> bool:
@@ -120,6 +164,12 @@ async def _reverse(session: AsyncSession, action: Action, group: Group, now: dat
     if action.kind == "add_expense":
         await session.execute(
             update(Expense).where(Expense.created_by_action_id == action.id).values(deleted_at=now)
+        )
+    elif action.kind == "settle_up":
+        await session.execute(
+            update(Settlement)
+            .where(Settlement.created_by_action_id == action.id)
+            .values(deleted_at=now)
         )
     elif action.kind == "delete_expense":
         expense = await _target_expense(session, action)
@@ -210,6 +260,14 @@ async def _reapply(session: AsyncSession, action: Action, group: Group) -> None:
             # never resurrect an expense a standing delete action removed (§8)
             if not await _active_delete_exists(session, expense.id):
                 expense.deleted_at = None
+    elif action.kind == "settle_up":
+        # no delete-settlement command exists, so this undo is the only thing
+        # that can have hidden the row: revive unconditionally
+        await session.execute(
+            update(Settlement)
+            .where(Settlement.created_by_action_id == action.id)
+            .values(deleted_at=None)
+        )
     elif action.kind == "delete_expense":
         expense = await _target_expense(session, action)
         if expense.deleted_at is None:

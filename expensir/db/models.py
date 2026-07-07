@@ -132,6 +132,27 @@ class ExpenseSplit(Base):
     created_by_action_id: Mapped[int] = mapped_column(ForeignKey("actions.id"))
 
 
+class Settlement(Base):
+    """A recorded stated payment (ADR-0002): always one currency, one direction,
+    one row, one action (ADR-0007). Never policed against the pool."""
+
+    __tablename__ = "settlements"
+    __table_args__ = (
+        Index("ix_settlements_ledger_deleted_created", "ledger_id", "deleted_at", "created_at"),
+        Index("ix_settlements_created_by_action", "created_by_action_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ledger_id: Mapped[int] = mapped_column(ForeignKey("ledgers.id"))
+    from_user: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    to_user: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    amount_minor: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))
+    created_by_action_id: Mapped[int] = mapped_column(ForeignKey("actions.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Ledger(Base):
     __tablename__ = "ledgers"
     # create-board-once guard (ADR-0003, §5). Composite because Telegram message ids are

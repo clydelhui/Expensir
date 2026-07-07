@@ -14,6 +14,7 @@ SLICE_1_TABLES = {
     "processed_updates",
 }
 SLICE_2_TABLES = {"expenses", "expense_splits", "actions"}
+SLICE_9_TABLES = {"settlements"}
 
 
 def upgrade_config(url: str) -> Config:
@@ -32,7 +33,7 @@ def test_migrations_apply_cleanly_on_sqlite(tmp_path):
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert tables >= SLICE_1_TABLES | SLICE_2_TABLES
+    assert tables >= SLICE_1_TABLES | SLICE_2_TABLES | SLICE_9_TABLES
 
 
 def test_exported_database_url_never_hijacks_a_programmatic_url(tmp_path, monkeypatch):
