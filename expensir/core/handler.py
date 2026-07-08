@@ -41,6 +41,7 @@ from expensir.domain.identity import (
     ensure_group,
     mark_left,
     register_member,
+    registered_members_with_usernames,
     resolve_expense_id,
     resolve_refs,
 )
@@ -56,6 +57,7 @@ from expensir.format.keyboards import (
 )
 from expensir.format.render import (
     LedgerLine,
+    MemberLine,
     action_proposal_reply,
     balance_reply,
     delete_reply,
@@ -63,6 +65,7 @@ from expensir.format.render import (
     expense_reply,
     join_names,
     ledgers_reply,
+    members_reply,
     proposal_reply,
     settle_reply,
 )
@@ -79,6 +82,7 @@ from expensir.intents.commands import (
     parse_equal,
     parse_exact,
     parse_homecurrency,
+    parse_members,
     parse_newledger,
     parse_percent,
     parse_settle,
@@ -1076,6 +1080,22 @@ async def _run_ledgers(
     return Reply(text=ledgers_reply(lines))
 
 
+async def _run_members(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    # a container-inspection read (ADR-0011): slash-only, no lock, no action row (§0.7)
+    parse_members(message["text"])  # no-arg guard; a trailing token is a usage error
+    lines = [
+        MemberLine(
+            display_name=member.display_name,
+            username=username,
+            is_you=actor is not None and member.id == actor.id,
+        )
+        for member, username in await registered_members_with_usernames(session, group.id)
+    ]
+    return Reply(text=members_reply(lines))
+
+
 def _expense_runner(parse: Callable[[str], ParsedExpense]) -> CommandRunner:
     async def run(
         message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
@@ -1361,6 +1381,7 @@ _RUNNERS: dict[str, CommandRunner] = {
     "currency": _run_currency,
     "newledger": _run_newledger,
     "ledgers": _run_ledgers,
+    "members": _run_members,
     "switch": _run_switch,
     "archive": _run_archive,
     "unarchive": _run_unarchive,

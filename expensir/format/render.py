@@ -26,6 +26,24 @@ def ledgers_reply(lines: list[LedgerLine]) -> str:
     return "Ledgers\n" + "\n".join(rendered)
 
 
+@dataclass(frozen=True)
+class MemberLine:
+    display_name: str
+    username: str | None  # None -> no @handle (Telegram allows no username)
+    is_you: bool  # the caller's own line, marked "— you"
+
+
+def members_reply(lines: list[MemberLine]) -> str:
+    """The /members roster (#22, ADR-0011): current members, alphabetical by display
+    name (case-insensitive), each with its @handle when set and the caller marked."""
+    rendered = []
+    for member in sorted(lines, key=lambda m: m.display_name.lower()):
+        handle = f" (@{member.username})" if member.username else ""
+        you = " — you" if member.is_you else ""
+        rendered.append(f"• {member.display_name}{handle}{you}")
+    return f"Members ({len(lines)}):\n" + "\n".join(rendered)
+
+
 _SPLIT_LABEL = {
     "exact": "split exactly",
     "shares": "split by shares",

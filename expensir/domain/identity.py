@@ -195,6 +195,28 @@ async def registered_members(session: AsyncSession, group_id: int) -> list[User]
     )
 
 
+async def registered_members_with_usernames(
+    session: AsyncSession, group_id: int
+) -> list[tuple[User, str | None]]:
+    """Current members (§11) paired with their Telegram @username (None when unset —
+    Telegram allows no username). The inner join is safe: no ghosts means every
+    member has an identity row (§5, §11). For the /members roster (#22)."""
+    rows = (
+        await session.execute(
+            select(User, Identity.username)
+            .join(GroupMember, GroupMember.user_id == User.id)
+            .join(Identity, Identity.user_id == User.id)
+            .where(
+                GroupMember.group_id == group_id,
+                GroupMember.left_at.is_(None),
+                Identity.platform == "telegram",
+            )
+            .order_by(User.id)
+        )
+    ).all()
+    return [(member, username) for member, username in rows]
+
+
 async def _identity_of(session: AsyncSession, platform_user_id: int) -> Identity | None:
     return (
         await session.execute(
