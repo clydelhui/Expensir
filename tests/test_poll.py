@@ -36,3 +36,28 @@ async def test_poll_once_with_no_updates_keeps_offset(deps):
 
     assert await poll_once(deps, client, offset=12) == 12
     assert client.sent == []
+
+
+async def test_poll_once_survives_a_handler_error_and_advances_past_the_bad_update(deps, monkeypatch):
+    """One update whose handler raises must not kill the loop, and its offset must
+    still advance so Telegram doesn't redeliver the poison update forever."""
+    from expensir.transports import poll as poll_mod
+
+    async def dispatch_that_blows_up_on_5(update, deps):
+        if update["update_id"] == 5:
+            raise RuntimeError("handler blew up")
+        return []
+
+    monkeypatch.setattr(poll_mod, "dispatch", dispatch_that_blows_up_on_5)
+    client = FakePollClient(
+        [
+            [
+                message_update(update_id=5, chat_id=-42, text="poison"),
+                message_update(update_id=6, chat_id=-42, text="/start"),
+            ]
+        ]
+    )
+
+    new_offset = await poll_once(deps, client, offset=0)
+
+    assert new_offset == 7  # advanced past both, including the update that raised

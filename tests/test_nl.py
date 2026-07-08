@@ -125,6 +125,62 @@ async def test_an_nl_expense_renders_a_pinned_proposal_and_commits_nothing(deps)
     assert send.records_message_for_pending_id == pending.id
 
 
+EXACT_WITH_SAM = WireAddExpense(
+    payer_ref="me",
+    amount="40",
+    currency=None,
+    description="dinner",
+    split_type="exact",
+    participants=[
+        WireSplitMember(user_ref="me", exact="25"),
+        WireSplitMember(user_ref="Sam", exact="15"),
+    ],
+)
+
+
+async def test_an_nl_exact_split_converts_per_person_amounts_and_proposes(deps):
+    """Regression: the NL path dropped WireSplitMember.exact, so every exact split
+    reached split_shares with exact_minor=None and crashed mid-proposal (§7.1)."""
+    await arrange_group(deps)
+    deps.llm = FakeLLM([EXACT_WITH_SAM])
+
+    (send,) = await mention(deps, "I paid 40 for dinner: I owe 25, Sam 15")
+
+    assert send.kind == "send_message"
+    assert "SGD 25.00" in send.text and "SGD 15.00" in send.text  # the stated exact parts
+    assert "reply to correct" in send.text
+    async with deps.session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(PendingIntent))
+        ).scalar() == 1
+
+
+async def test_an_nl_exact_split_missing_an_amount_rejects_gracefully(deps):
+    """A weak model can label a split 'exact' without stating per-person amounts;
+    that must be a friendly reply at the NL edge (ADR-0009), never an AssertionError
+    that escapes the handler and kills the poll loop."""
+    await arrange_group(deps)
+    deps.llm = FakeLLM(
+        [
+            WireAddExpense(
+                amount="40",
+                description="dinner",
+                split_type="exact",
+                participants=[WireSplitMember(user_ref="me"), WireSplitMember(user_ref="Sam")],
+            )
+        ]
+    )
+
+    (send,) = await mention(deps, "I paid 40 for dinner split exactly")
+
+    assert "exact split" in send.text.lower()
+    assert send.reply_markup is None
+    async with deps.session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(PendingIntent))
+        ).scalar() == 0
+
+
 async def propose_dinner(deps, **mention_kwargs) -> int:
     """Arrange + propose the 40-SGD dinner; returns the pending row's id."""
     await arrange_group(deps)

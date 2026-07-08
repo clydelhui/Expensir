@@ -121,10 +121,45 @@ def _add_expense(
         description=wire.description,
         occurred_on=wire.occurred_on,
         split_type=wire.split_type,
-        participants=[
-            SplitMember(user_ref=p.user_ref, weight=p.weight, percent=p.percent)
-            for p in wire.participants
-        ],
+        participants=_split_members(wire, currency),
         confidence=wire.confidence,
     )
     return ConvertedIntent(intent=intent, rounded_from=wire.amount if was_rounded else None)
+
+
+def _split_members(wire: WireAddExpense, currency: str) -> list[SplitMember]:
+    """Per-split-type members, mirroring the slash path (handler._split_members).
+
+    A valued split needs its field on EVERY participant, and 'exact' amounts are
+    money that must convert with the resolved currency. A missing or too-fine
+    value is a user-facing ValueError at the NL edge (ADR-0009) — never a
+    downstream assert that would crash mid-proposal on a stray model output."""
+    if wire.split_type == "equal":
+        # empty participants keeps the §4 convention: all REGISTERED members
+        return [SplitMember(user_ref=p.user_ref) for p in wire.participants]
+    if not wire.participants:
+        raise ValueError(f"A {wire.split_type} split needs a value stated for each person.")
+    if wire.split_type == "exact":
+        members = []
+        for p in wire.participants:
+            if p.exact is None:
+                raise ValueError("An exact split needs a stated amount for each person.")
+            minor, was_rounded = to_minor(p.exact, currency)
+            if was_rounded:
+                # exact parts are the user's stated amounts (mirrors the slash path)
+                raise ValueError(
+                    f"{p.exact} doesn't land on the smallest {currency} unit — "
+                    f"exact amounts can't be finer than that."
+                )
+            members.append(SplitMember(user_ref=p.user_ref, exact_minor=minor))
+        return members
+    if wire.split_type == "shares":
+        for p in wire.participants:
+            if p.weight is None:
+                raise ValueError("A shares split needs a weight for each person.")
+        return [SplitMember(user_ref=p.user_ref, weight=p.weight) for p in wire.participants]
+    # percent
+    for p in wire.participants:
+        if p.percent is None:
+            raise ValueError("A percent split needs a percentage for each person.")
+    return [SplitMember(user_ref=p.user_ref, percent=p.percent) for p in wire.participants]
