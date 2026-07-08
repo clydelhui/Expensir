@@ -23,7 +23,9 @@ that keeps the domain pure and routes all writes through `apply_intent`.
 > - **No ghosts.** Only registered members may appear in a transaction. Any reference to an
 >   unregistered person **rejects the whole intent** with guidance on how to register them. (Import is
 >   the one exception — it registers members from the backup file, ADR-0005.)
-> - **Undo/redo are button-only**, never NL-triggered. Every other command is NL-reachable.
+> - **Undo/redo are button-only**, never NL-triggered, and the **container-inspection reads**
+>   (`/ledgers`, `/members` — "what's *in* this container?") are **slash-only**. Every other command,
+>   including content reads like `/balance`, is NL-reachable. (ADR-0011.)
 > - **Settlements are recorded stated facts** (ADR-0002), and every settlement is **one line** —
 >   one currency, one direction, one action (ADR-0007). The board `[Settle]` button and the settle
 >   sheet follow the solver; `/settle` with an amount is an ungated escape hatch (any direction,

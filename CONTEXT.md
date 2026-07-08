@@ -90,8 +90,16 @@ _Avoid_: dump, snapshot (reserved for the pre-import safety snapshot)
 The single shared contract every input (slash command, natural language, receipt photo) is parsed into before anything downstream runs. The parser is never the source of truth for math or persistence.
 
 **Proposal**:
-A rendered summary of a fuzzy intent (from NL/OCR, or an ambiguous reference) shown with Confirm/Cancel, awaiting a tap. Its intent is stored unresolved and re-resolved at confirm time, but it is pinned to the ledger it was proposed against — confirming commits there even if the group's active ledger changed meanwhile. Any member may confirm or cancel (the usual anyone-may-act trust model, with Undo as the guardrail); references like "me" keep meaning the proposer, while the action audits the presser as the one who committed it. A reply to a live proposal refines it in place; a reply to a dead one starts a fresh proposal.
+A rendered summary of a fuzzy intent (from NL/OCR, or an ambiguous reference) shown with Confirm/Cancel, awaiting a tap. Its intent is stored unresolved and re-resolved at confirm time, but it is pinned to the ledger it was proposed against — confirming commits there even if the group's active ledger changed meanwhile. Any member may confirm, cancel, or refine it (the usual anyone-may-act trust model, with Undo as the guardrail); a first-person reference ("me", "I") means the author of the message that introduced it — the proposer for the original text, the replier for a correction — and a confirm tap never re-anchors it, while the action audits the presser as the one who committed it. A proposal is live until confirmed, cancelled, or expired — then it is dead. A reply to a live proposal is a correction; a reply to a dead one (or to any other bot message, board included) starts a fresh intent — there is no resend dead-end.
 _Avoid_: draft, preview
+
+**Correction**:
+A reply to a live proposal that rewrites its intent in place. Any member may correct, and a correction may change what is proposed entirely — an expense into a settlement — but only ever to another mutation: a reply that turns out to be a read is answered inline, and one the bot cannot read as a correction is met with guidance; in both cases the proposal stands untouched. First-person references in a correction mean the correction's author, not the original proposer. A successful correction keeps the proposal live longer.
+_Avoid_: edit (reserved for editing a committed expense), amendment
+
+**Pick-list**:
+A pre-confirm stage on a proposal that presents one ambiguous reference — a member name or a described expense matching more than one candidate — as tap-to-choose options. Slots resolve one at a time, by tap or by correction; a choice pins the slot to a concrete member or expense, and Confirm appears only once every slot is pinned. Ambiguity discovered at any point — at propose, after a correction, or on a confirm tap — puts the proposal (back) in this stage: the bot never guesses. Slot pinning is distinct from a proposal's pinned ledger and from the pinned board.
+_Avoid_: picker (reserved for the guided /add flow), menu
 
 **Action**:
 One audited, reversible unit of change. Every mutation appends exactly one action row, and every data row it writes carries that action's id, so undo is "soft-delete everything this action created." Reads and lifecycle events (join, leave, reactivation, identity refresh) write no action; registration via `/setup` appends one — permanent, with no undo.
