@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None  # provider-specific id; verify in the dashboard (§1)
+    # cloud providers answer in <30s; a local model (Ollama) can be far slower,
+    # especially on a cold load — raise this for local dev, keep it tight in prod
+    # so a hung call can't block a webhook for minutes (§12).
+    llm_timeout_seconds: float = 30.0
     pending_ttl_minutes: int = 15  # proposal TTL (§10, §17)
 
     @field_validator(

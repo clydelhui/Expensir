@@ -24,12 +24,13 @@ class OpenAICompatLLM:
         base_url: str,
         api_key: str,
         model: str,
+        timeout: float = 30.0,
         http: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
-        self._http = http if http is not None else httpx.AsyncClient(timeout=30.0)
+        self._http = http if http is not None else httpx.AsyncClient(timeout=timeout)
 
     async def extract_text(self, text: str) -> WireResult:
         """One parse attempt + one retry showing the validation error (issue #13

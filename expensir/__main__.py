@@ -21,14 +21,19 @@ def _make_llm(settings: Settings) -> LLMClient | None:
     if not (settings.llm_base_url and settings.llm_api_key and settings.llm_model):
         return None
     return OpenAICompatLLM(
-        base_url=settings.llm_base_url, api_key=settings.llm_api_key, model=settings.llm_model
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout=settings.llm_timeout_seconds,
     )
 
 
-def main() -> None:
-    settings = Settings()  # type: ignore[call-arg]  # fields come from env/.env at runtime
+async def _run(settings: Settings) -> None:
+    # One event loop for the whole process: the Telegram client's httpx pool binds
+    # to the loop that first uses it, so get_me(), run_poll() and uvicorn must all
+    # share this loop — a second asyncio.run() would close it and strand the pool.
     telegram = HttpxTelegramClient(settings.bot_token, api_base=settings.telegram_api_base)
-    bot_username = asyncio.run(telegram.get_me()).get("username")
+    bot_username = (await telegram.get_me()).get("username")
     deps = Deps(
         session_factory=make_session_factory(settings.database_url),
         bot_username=bot_username,
@@ -40,10 +45,16 @@ def main() -> None:
     )
 
     if settings.mode == "poll":
-        asyncio.run(run_poll(deps, telegram))
+        await run_poll(deps, telegram)
     else:
         app = create_app(deps, telegram, settings.telegram_webhook_secret)
-        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+        config = uvicorn.Config(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+        await uvicorn.Server(config).serve()
+
+
+def main() -> None:
+    settings = Settings()  # type: ignore[call-arg]  # fields come from env/.env at runtime
+    asyncio.run(_run(settings))
 
 
 if __name__ == "__main__":
