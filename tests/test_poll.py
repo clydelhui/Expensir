@@ -38,7 +38,7 @@ async def test_poll_once_with_no_updates_keeps_offset(deps):
     assert client.sent == []
 
 
-async def test_poll_once_survives_a_handler_error_and_advances_past_the_bad_update(deps, monkeypatch):
+async def test_poll_once_survives_a_handler_error(deps, monkeypatch):
     """One update whose handler raises must not kill the loop, and its offset must
     still advance so Telegram doesn't redeliver the poison update forever."""
     from expensir.transports import poll as poll_mod

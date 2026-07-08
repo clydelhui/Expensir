@@ -128,12 +128,18 @@ def _add_expense(
 
 
 def _split_members(wire: WireAddExpense, currency: str) -> list[SplitMember]:
-    """Per-split-type members, mirroring the slash path (handler._split_members).
+    """Per-split-type members, close to the slash path's handler._split_members.
 
     A valued split needs its field on EVERY participant, and 'exact' amounts are
     money that must convert with the resolved currency. A missing or too-fine
     value is a user-facing ValueError at the NL edge (ADR-0009) — never a
-    downstream assert that would crash mid-proposal on a stray model output."""
+    downstream assert that would crash mid-proposal on a stray model output.
+
+    One deliberate divergence from slash: /shares defaults an unstated weight to 1
+    (parse_shares default_value='1'), but NL has no positional syntax, so an
+    unweighted shares/percent split is an error here rather than a silent default —
+    the model is expected to state each value. (A future slice may ask the user to
+    clarify instead of rejecting.)"""
     if wire.split_type == "equal":
         # empty participants keeps the §4 convention: all REGISTERED members
         return [SplitMember(user_ref=p.user_ref) for p in wire.participants]
