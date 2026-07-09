@@ -15,8 +15,13 @@ from expensir.db.models import Action, Expense, ExpenseSplit, Group, Ledger, Use
 from expensir.domain.allocate import allocate
 from expensir.domain.balances import net_positions
 from expensir.domain.currency import require_known_currency
-from expensir.domain.errors import Rejection
-from expensir.domain.identity import register_setup_target, registered_members, resolve_refs
+from expensir.domain.errors import AmbiguousRef, Rejection
+from expensir.domain.identity import (
+    register_setup_target,
+    registered_members,
+    resolve_expense_match,
+    resolve_refs,
+)
 from expensir.domain.ledgers import find_ledger, most_recent_open
 from expensir.domain.money import fmt
 from expensir.domain.settle import record_settlement
@@ -128,6 +133,16 @@ Applied = (
 async def apply_intent(intent: Intent, ctx: ApplyContext) -> Applied | None:
     await per_group_lock(ctx.session, ctx.group.id)
     await ctx.session.refresh(ctx.group)  # post-lock re-read (ADR-0003)
+    try:
+        return await _apply(intent, ctx)
+    except AmbiguousRef as ambiguous:
+        # never guess (§0.9): the doors that can park a pick-stage proposal
+        # need the intent that was being applied (§13, issue #14)
+        ambiguous.intent = intent
+        raise
+
+
+async def _apply(intent: Intent, ctx: ApplyContext) -> Applied | None:
     if isinstance(intent, AddExpense):
         return await _apply_add_expense(intent, ctx)
     if isinstance(intent, SettleUp):
@@ -303,9 +318,19 @@ def _per_user(intent: AddExpense, resolved: dict[str, User], attr: str) -> dict[
     return values
 
 
+async def _expense_id_of(intent: DeleteExpense | EditExpense, ctx: ApplyContext) -> int:
+    """The concrete expense a delete/edit means. Normally pinned before Confirm
+    ever appears (§13); an unpinned descriptive match resolves here — unique or
+    nothing (§11 tertiary)."""
+    if intent.expense_id is not None:
+        return intent.expense_id
+    assert intent.match is not None  # the input edge guarantees one of the two
+    return (await resolve_expense_match(ctx.session, ctx.target_ledger_id(), intent.match)).id
+
+
 async def _apply_delete_expense(intent: DeleteExpense, ctx: ApplyContext) -> AppliedExpenseChange:
     _require_actor(ctx)
-    expense = await _sealed_expense(intent.expense_id, ctx)
+    expense = await _sealed_expense(await _expense_id_of(intent, ctx), ctx)
     if expense.deleted_at is not None:
         raise Rejection(f"🤷 #{expense.id} is already gone — nothing to delete.")
     action = await _append_action(ctx, intent)
@@ -317,7 +342,7 @@ async def _apply_delete_expense(intent: DeleteExpense, ctx: ApplyContext) -> App
 async def _apply_edit_expense(intent: EditExpense, ctx: ApplyContext) -> AppliedExpenseChange:
     """Non-financial fields only (§4, §8): display changes, never a balance change (§0.4)."""
     _require_actor(ctx)
-    expense = await _sealed_expense(intent.expense_id, ctx)
+    expense = await _sealed_expense(await _expense_id_of(intent, ctx), ctx)
     if expense.deleted_at is not None:
         raise Rejection(
             f"🚫 #{expense.id} is deleted — tap ↩️ Undo on its delete first if you want it back."
@@ -343,24 +368,32 @@ async def _apply_edit_expense(intent: EditExpense, ctx: ApplyContext) -> Applied
     return AppliedExpenseChange(action_id=action.id, expense=expense)
 
 
-async def _sealed_expense(expense_id: int, ctx: ApplyContext) -> Expense:
+async def sealed_expense(
+    session: AsyncSession, group_id: int, target_ledger_id: int, expense_id: int
+) -> Expense:
     """Load an expense reference, enforcing the ledger seal (§0.10, §11).
 
     Another group's expense reads as not-found — the bot stays silent about
-    other groups; another ledger of THIS group is refused with a pointer to switch.
+    other groups; another ledger of THIS group is refused with a pointer to
+    switch. The proposal preview and the commit share this seal: what the
+    preview names is exactly what Confirm may touch.
     """
     not_found = Rejection(f"🚫 I can't find expense #{expense_id} here — check the #id.")
-    expense = await ctx.session.get(Expense, expense_id)
+    expense = await session.get(Expense, expense_id)
     if expense is None:
         raise not_found
-    ledger = await ctx.session.get_one(Ledger, expense.ledger_id)
-    if ledger.group_id != ctx.group.id:
+    ledger = await session.get_one(Ledger, expense.ledger_id)
+    if ledger.group_id != group_id:
         raise not_found
-    if expense.ledger_id != ctx.target_ledger_id():
+    if expense.ledger_id != target_ledger_id:
         raise Rejection(
             f"🔒 #{expense_id} is in 📒 {ledger.name} — switch there first, then try again."
         )
     return expense
+
+
+async def _sealed_expense(expense_id: int, ctx: ApplyContext) -> Expense:
+    return await sealed_expense(ctx.session, ctx.group.id, ctx.target_ledger_id(), expense_id)
 
 
 async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -> AppliedFlip:

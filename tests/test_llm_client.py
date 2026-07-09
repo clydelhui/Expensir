@@ -127,3 +127,15 @@ async def test_the_system_prompt_defines_the_wire_contract():
         "undo_redo",
     ):
         assert kind in system["content"], f"prompt must cover {kind} (§12)"
+
+
+async def test_the_prompt_teaches_the_descriptive_match_field():
+    """Issue #14 scope addition: "delete the dinner one" must extract a match
+    query for the app to resolve CPU-side — never come back unknown."""
+    llm, requests = client_returning(completion_with('{"kind": "undo_redo"}'))
+
+    await llm.extract_text("undo that")
+
+    system = requests[0]["messages"][0]["content"]
+    assert '"match"' in system  # the field, in both mutation schemas
+    assert "delete the dinner one" in system  # a few-shot showing the extraction

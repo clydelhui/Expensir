@@ -5,6 +5,8 @@ computes — currency resolution and minor-unit math stay app-side (wire schema,
 issue #13 grill). Few-shots below mirror tests/fixtures/llm/extractions.json.
 """
 
+import json
+
 SYSTEM_PROMPT = """\
 You parse ONE Telegram group-chat message addressed to an expense-splitting bot \
 into EXACTLY ONE JSON object. Output ONLY that JSON object — no prose, no markdown fences.
@@ -31,10 +33,14 @@ The object is discriminated by "kind" — pick exactly one:
 - show_balance — asking who owes what.
   {"kind":"show_balance","scope":"me"|"group","convert_to":ISO-or-null}
 - delete_expense — remove a logged expense.
-  {"kind":"delete_expense","expense_id":NUMBER-from-#id-or-null}
+  {"kind":"delete_expense","expense_id":NUMBER-from-#id-or-null,"match":TEXT-or-null}
+  "match": when no #id is given but the expense is named by description ("the dinner \
+one"), copy the describing words ("dinner"); null when a #id is given or nothing describes it.
 - edit_expense — change an expense's description and/or date ONLY (never amounts).
-  {"kind":"edit_expense","expense_id":NUMBER-or-null,"description":TEXT-or-null,\
-"occurred_on":"YYYY-MM-DD"-or-null}
+  {"kind":"edit_expense","expense_id":NUMBER-or-null,"match":TEXT-or-null,\
+"description":TEXT-or-null,"occurred_on":"YYYY-MM-DD"-or-null}
+  "match" works as in delete_expense: the words naming the EXISTING expense, \
+never the new description.
 - new_ledger — start a new book of expenses.
   {"kind":"new_ledger","name":TEXT,"logging_currency":ISO-or-null}
 - switch_ledger — make another ledger active. {"kind":"switch_ledger","name_or_id":TEXT}
@@ -67,10 +73,13 @@ Examples:
 "what do I owe?" -> {"kind":"show_balance","scope":"me","convert_to":null}
 "show balances" -> {"kind":"show_balance","scope":"group","convert_to":null}
 "convert everything to USD" -> {"kind":"show_balance","scope":"group","convert_to":"USD"}
-"delete #42" -> {"kind":"delete_expense","expense_id":42}
-"delete this" (replying to an expense) -> {"kind":"delete_expense","expense_id":null}
-"rename #7 to team lunch" -> {"kind":"edit_expense","expense_id":7,\
+"delete #42" -> {"kind":"delete_expense","expense_id":42,"match":null}
+"delete this" (replying to an expense) -> {"kind":"delete_expense","expense_id":null,"match":null}
+"delete the dinner one" -> {"kind":"delete_expense","expense_id":null,"match":"dinner"}
+"rename #7 to team lunch" -> {"kind":"edit_expense","expense_id":7,"match":null,\
 "description":"team lunch","occurred_on":null}
+"rename the taxi ride to airport run" -> {"kind":"edit_expense","expense_id":null,\
+"match":"taxi ride","description":"airport run","occurred_on":null}
 "new ledger called Tokyo in JPY" -> {"kind":"new_ledger","name":"Tokyo","logging_currency":"JPY"}
 "switch to Japan" -> {"kind":"switch_ledger","name_or_id":"Japan"}
 "archive this ledger" -> {"kind":"archive_ledger","name_or_id":null}
@@ -86,10 +95,54 @@ Examples:
 """
 
 
+REFINE_ADDENDUM = """\
+
+You are refining an ALREADY-PARSED proposal: the user replied to it with a correction. \
+You get the proposal's current intent as JSON and the correction text. Output the FULL \
+corrected intent as ONE JSON object in the same wire schema as above — not a diff.
+
+- Carry over every field the correction does not change. Amounts in the prior intent \
+are integers in minor units ("amount_minor": 4000 SGD = "40"); your output still uses \
+decimal strings exactly as the schema above says.
+- Refs of the form "id:<number>" are already-resolved people: echo them verbatim \
+unless the correction replaces that person.
+- A correction may change what is proposed entirely (an expense into a settle_up), \
+but if the reply is a question or a read ("what do I owe?") emit that read kind, and \
+if it is not about this proposal at all emit "unknown".
+"""
+
+
 def extraction_messages(text: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": text},
+    ]
+
+
+def refine_messages(
+    prior_intent: dict, correction: str, candidates: list[str] | None = None
+) -> list[dict[str, str]]:
+    """The reply-to-correct loop's prompt (§10.2): prior intent + correction ->
+    the full refined intent; candidates are the open pick-list slot's choices."""
+    picking = (
+        "The proposal is currently asking which of several matches was meant. "
+        'The choices, each as "<ref> = label", in order:\n'
+        + "\n".join(candidates)
+        + '\nIf the correction picks one (by name, part of it, or position like "the first '
+        'one"), echo the chosen candidate\'s ref: "id:<n>" is a person — use it as the '
+        'ref in your output; "expense_id:<n>" is an expense — set your output\'s '
+        '"expense_id" to <n>.\n'
+        if candidates
+        else ""
+    )
+    user = (
+        f"Current proposed intent:\n{json.dumps(prior_intent)}\n"
+        f"{picking}"
+        f"Correction reply:\n{correction}"
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT + REFINE_ADDENDUM},
+        {"role": "user", "content": user},
     ]
 
 

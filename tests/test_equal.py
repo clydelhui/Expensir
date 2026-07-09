@@ -251,10 +251,11 @@ async def test_an_amount_below_the_smallest_unit_is_rejected_helpfully(deps):
     assert await read_expenses(deps) == []
 
 
-async def test_an_ambiguous_stored_username_rejects_instead_of_crashing(deps):
+async def test_an_ambiguous_stored_username_parks_a_pick_list_instead_of_crashing(deps):
+    """Telegram reassigns freed @handles, so two members can share one; §0.7
+    makes the ambiguous /equal fuzzy: a pick-stage proposal, nothing committed.
+    The full pick-then-confirm loop is covered in test_picklist.py."""
     await setup_group(deps)
-    # Telegram reassigns freed usernames, and identity refresh is a later slice —
-    # so two registered members can legitimately share a stored @handle
     sam_a = user(1003, "Sam A", "sam")
     sam_b = user(1004, "Sam B", "sam")
     await dispatch(message_update(update_id=92, chat_id=-42, text="hi", from_user=sam_a), deps)
@@ -264,7 +265,8 @@ async def test_an_ambiguous_stored_username_rejects_instead_of_crashing(deps):
         message_update(update_id=5, chat_id=-42, text="/equal 60 dinner @sam"), deps
     )
 
-    assert "more than one" in reply.text.lower()
+    assert "@sam" in reply.text  # the pick-stage proposal names the slot
+    assert "v1:pick:" in str(reply.reply_markup)
     assert await read_expenses(deps) == []
 
 
