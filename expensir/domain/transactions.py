@@ -93,8 +93,14 @@ def decode_cursor(fragment: str) -> TransactionCursor:
     epoch_us, kind, row_id = fragment.split(":")
     if kind not in ("expense", "settlement"):
         raise ValueError(f"unknown transaction kind: {kind!r}")
+    try:
+        created_at = _EPOCH + timedelta(microseconds=int(epoch_us))
+    except OverflowError as error:
+        # a forged epoch beyond datetime's range is just another malformed
+        # fragment: keep the documented contract for every caller
+        raise ValueError(f"epoch_us out of range: {epoch_us}") from error
     return TransactionCursor(
-        created_at=_EPOCH + timedelta(microseconds=int(epoch_us)),
+        created_at=created_at,
         kind=cast("TransactionKind", kind),
         id=int(row_id),
     )
@@ -240,6 +246,8 @@ async def _enrich(
     session: AsyncSession, page: list[tuple[TransactionKind, Expense | Settlement]]
 ) -> list[TransactionRow]:
     """Attach the display names and participant counts the two-line render needs."""
+    if not page:
+        return []  # nothing to name: skip the queries entirely
     user_ids: set[int] = set()
     expense_ids: list[int] = []
     for kind, row in page:
