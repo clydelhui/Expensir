@@ -2,7 +2,7 @@
 /transactions listing and the feed (ADR-0013) can never drift apart."""
 
 from expensir.domain.money import fmt
-from expensir.domain.transactions import ExpenseRow, TransactionPage, TransactionRow
+from expensir.domain.transactions import Direction, ExpenseRow, TransactionPage, TransactionRow
 
 
 def transaction_line(tx: TransactionRow) -> str:
@@ -26,6 +26,22 @@ def transactions_reply(*, ledger_name: str, page: TransactionPage) -> str:
             f"📒 {ledger_name} • No transactions yet — log an expense with /equal, "
             "or record a payment with /settle."
         )
-    unit = "transaction" if page.total == 1 else "transactions"
-    header = f"📒 {ledger_name} • {page.total} {unit}, newest first"
-    return "\n\n".join([header, *(transaction_line(tx) for tx in page.rows)])
+    return "\n\n".join(
+        [_header(ledger_name, page.total), *(transaction_line(tx) for tx in page.rows)]
+    )
+
+
+def transactions_fallback_reply(
+    *, ledger_name: str, page: TransactionPage, direction: Direction
+) -> str:
+    """A pager tap that landed past the end (ADR-0012): the rows behind the
+    tapped button were deleted meanwhile. Same header, refreshed count — or the
+    empty nudge when the whole ledger was emptied out from under the pager."""
+    if page.total == 0:
+        return transactions_reply(ledger_name=ledger_name, page=page)
+    return f"{_header(ledger_name, page.total)}\n\nNo {direction} transactions."
+
+
+def _header(ledger_name: str, total: int) -> str:
+    unit = "transaction" if total == 1 else "transactions"
+    return f"📒 {ledger_name} • {total} {unit}, newest first"

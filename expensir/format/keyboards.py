@@ -59,32 +59,35 @@ def sheet_keyboard(ledger_id: int, transfers: list[BoardLine]) -> InlineKeyboard
     }
 
 
-def transactions_pager_keyboard(ledger_id: int, page: TransactionPage) -> InlineKeyboard | None:
+def transactions_pager_keyboard(
+    ledger_id: int, page: TransactionPage, anchor: TransactionCursor | None = None
+) -> InlineKeyboard | None:
     """The /transactions pager (ADR-0012): keyset cursors anchored on the page's
-    edge rows, the ledger pinned at render time like the settle sheet's."""
-    if not page.rows:
-        # a cursor page can resolve to zero rows while has_newer/has_older stay
-        # True (concurrent delete of the last row on this side): nothing to anchor
-        return None
+    edge rows, the ledger pinned at render time like the settle sheet's.
+
+    A rowless page (a tap that landed past the end) has no edge to anchor on:
+    each button falls back to `anchor` — the tapped cursor — when the caller
+    passes one. The plain listing passes none, so its empty page has no pager."""
+    newer = _cursor_of(page.rows[0]) if page.rows else anchor
+    older = _cursor_of(page.rows[-1]) if page.rows else anchor
     buttons: list[dict[str, str]] = []
-    if page.has_newer:
-        buttons.append(
-            {"text": "◀ Newer", "callback_data": _tx_cursor(ledger_id, "p", page.rows[0])}
-        )
-    if page.has_older:
-        buttons.append(
-            {"text": "▶ Older", "callback_data": _tx_cursor(ledger_id, "n", page.rows[-1])}
-        )
+    if page.has_newer and newer is not None:
+        buttons.append({"text": "◀ Newer", "callback_data": _tx_data(ledger_id, "p", newer)})
+    if page.has_older and older is not None:
+        buttons.append({"text": "▶ Older", "callback_data": _tx_data(ledger_id, "n", older)})
     if not buttons:
         return None
     return {"inline_keyboard": [buttons]}
 
 
-def _tx_cursor(ledger_id: int, verb: str, anchor: TransactionRow) -> str:
+def _cursor_of(row: TransactionRow) -> TransactionCursor:
+    return TransactionCursor(created_at=row.created_at, kind=row.kind, id=row.id)
+
+
+def _tx_data(ledger_id: int, verb: str, anchor: TransactionCursor) -> str:
     """v1:tx:<ledger_id>:<n|p>:<epoch_us>:<kind>:<row_id> — ~40 bytes, within
     Telegram's 64-byte callback_data budget (ADR-0012)."""
-    cursor = TransactionCursor(created_at=anchor.created_at, kind=anchor.kind, id=anchor.id)
-    return f"v1:tx:{ledger_id}:{verb}:{encode_cursor(cursor)}"
+    return f"v1:tx:{ledger_id}:{verb}:{encode_cursor(anchor)}"
 
 
 def confirm_keyboard(pending_id: int) -> InlineKeyboard:

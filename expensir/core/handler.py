@@ -53,7 +53,12 @@ from expensir.domain.identity import (
 from expensir.domain.ledgers import find_ledger, ledgers_of
 from expensir.domain.money import fmt, to_minor
 from expensir.domain.settle import record_settlement, suggested_amount
-from expensir.domain.transactions import PAGE_SIZE, list_transactions
+from expensir.domain.transactions import (
+    PAGE_SIZE,
+    Direction,
+    decode_cursor,
+    list_transactions,
+)
 from expensir.domain.undo import ToggleDirection, toggle
 from expensir.format.keyboards import (
     InlineKeyboard,
@@ -80,7 +85,7 @@ from expensir.format.render import (
     proposal_reply,
     settle_reply,
 )
-from expensir.format.transactions import transactions_reply
+from expensir.format.transactions import transactions_fallback_reply, transactions_reply
 from expensir.intents import nl
 from expensir.intents.commands import (
     DELETE_USAGE,
@@ -137,6 +142,8 @@ _SETTLE_DATA = re.compile(r"^v1:st:(\d+):(\d+):([A-Z]{3}):(\d+)$")
 # a settle-sheet line (ADR-0007): same tuple + token, prefixed with the ledger —
 # a sheet message is not the pinned board, so the tap can't resolve it from the chat
 _SHEET_DATA = re.compile(r"^v1:sh:(\d+):(\d+):(\d+):([A-Z]{3}):(\d+)$")
+# a /transactions pager tap (ADR-0012): pinned ledger, direction verb, keyset anchor
+_TX_DATA = re.compile(r"^v1:tx:(\d+):([np]):(\d+):(expense|settlement):(\d+)$")
 _INTENT: TypeAdapter[Intent] = TypeAdapter(Intent)
 # an expense pick-list shows only this many, newest first (issue #14 grill):
 # beyond it the message says what was dropped and points at #id
@@ -230,6 +237,9 @@ async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[O
     sheet = _SHEET_DATA.match(callback.get("data") or "")
     if sheet is not None:
         return await _handle_sheet_tap(callback, sheet, deps)
+    tx = _TX_DATA.match(callback.get("data") or "")
+    if tx is not None:
+        return await _handle_tx_tap(callback, tx, deps)
     match = _TOGGLE_DATA.match(callback.get("data") or "")
     if match is None:
         return [ack]  # not a button of any slice so far; acknowledge so the spinner stops
@@ -811,6 +821,56 @@ async def _handle_sheet_tap(
         sheet = await _refresh_sheet(session, ledger, payer, receiver, chat, sheet_message_id)
     ack.text = "🤝 Recorded."
     return [ack, result, *sheet, *board]
+
+
+async def _handle_tx_tap(
+    callback: dict[str, Any], match: re.Match[str], deps: Deps
+) -> list[OutboundAction]:
+    """A /transactions pager tap (ADR-0012): a plain read — no lock, no action
+    row — that re-renders the tapped listing in place (snapshot semantics).
+    The ledger is pinned in the callback, so the tap keeps paging the ledger
+    the listing was rendered for even if the group /switch'ed meanwhile."""
+    ack = AnswerCallbackQuery(callback_query_id=callback["id"])
+    ledger_id = int(match.group(1))
+    direction: Direction = "older" if match.group(2) == "n" else "newer"
+    try:
+        cursor = decode_cursor(":".join(match.group(3, 4, 5)))
+    except ValueError:
+        # a forged epoch_us beyond datetime's range: no such anchor, nothing to page
+        return [ack]
+
+    message = callback.get("message") or {}
+    chat = message.get("chat")
+    if chat is None or chat["type"] not in ("group", "supergroup"):
+        return [ack]
+
+    async with deps.session_factory() as session, session.begin():
+        group = await ensure_group(session, chat["id"], chat.get("title"))
+        ledger = await session.get(Ledger, ledger_id)
+        if ledger is None or ledger.group_id != group.id:
+            ack.text = "That button doesn't match anything I recorded."
+            return [ack]
+        page = await list_transactions(
+            session, ledger.id, limit=PAGE_SIZE, cursor=cursor, direction=direction
+        )
+        if not page.rows and page.total and not (page.has_newer or page.has_older):
+            # deletions left nothing strictly beyond the anchor on either side,
+            # yet the ledger still stands (only the anchor row survives): the
+            # past-the-end page would dead-end, so reset to /transactions' page 1
+            page = await list_transactions(session, ledger.id, limit=PAGE_SIZE)
+        if page.rows:
+            text = transactions_reply(ledger_name=ledger.name, page=page)
+        else:
+            # past the end: the rows behind the tapped button were deleted
+            # meanwhile; the way back anchors on the tapped cursor itself
+            text = transactions_fallback_reply(
+                ledger_name=ledger.name, page=page, direction=direction
+            )
+        markup = transactions_pager_keyboard(ledger.id, page, cursor)
+    edit = EditMessage(
+        chat_id=chat["id"], message_id=message["message_id"], text=text, reply_markup=markup
+    )
+    return [ack, edit]
 
 
 async def _current_suggested(
