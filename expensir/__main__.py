@@ -24,6 +24,7 @@ def _make_llm(settings: Settings) -> LLMClient | None:
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
+        vision_model=settings.llm_vision_model,  # None -> photos stay invisible (issue #15)
         timeout=settings.llm_timeout_seconds,
     )
 
@@ -41,6 +42,7 @@ async def _run(settings: Settings) -> None:
         undo_window_hours=settings.undo_window_hours,
         client=telegram,  # board creation sends inside the locked transaction (ADR-0003)
         llm=_make_llm(settings),
+        files=telegram,  # photo bytes for the vision door (issue #15)
         pending_ttl_minutes=settings.pending_ttl_minutes,
     )
 

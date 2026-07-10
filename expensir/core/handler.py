@@ -4,7 +4,7 @@ import contextlib
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from pydantic import TypeAdapter
 from sqlalchemy import select
@@ -127,7 +127,15 @@ from expensir.intents.schema import (
     Unknown,
 )
 from expensir.llm.base import LLMClient, LLMUnavailable
-from expensir.llm.wire import WireDeleteExpense, WireEditExpense, WireSetup, WireUndoRedo
+from expensir.llm.wire import (
+    WireAddExpense,
+    WireDeleteExpense,
+    WireEditExpense,
+    WireSettleUp,
+    WireSetup,
+    WireUndoRedo,
+    WireUnknown,
+)
 
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
 # Confirm/Cancel on a proposal (§10), keyed by the pending row's id
@@ -156,6 +164,9 @@ SETUP_GUIDANCE = (
     "👥 To register someone who hasn't spoken yet, reply to one of their "
     "messages with /setup, or mention them by tapping their name so the "
     "mention links their account. A bare @username isn't enough."
+)
+PHOTO_FETCH_FAILURE = (
+    "⚠️ I couldn't fetch that photo from Telegram — nothing was changed; " "try sending it again."
 )
 
 
@@ -188,6 +199,15 @@ WELCOME = (
 )
 
 
+class FileSource(Protocol):
+    """Fetches a Telegram file's bytes by file_id (getFile + download, §13).
+
+    Returns None when the fetch fails, so the vision door replies transiently
+    instead of crashing mid-update (issue #15 grill)."""
+
+    async def download_file(self, file_id: str) -> bytes | None: ...
+
+
 @dataclass
 class Deps:
     session_factory: async_sessionmaker[AsyncSession]
@@ -200,6 +220,8 @@ class Deps:
     client: BoardMessenger | None = None
     # the NL extractor (§12, ADR-0010); None (unconfigured) leaves mentions unanswered
     llm: LLMClient | None = None
+    # photo bytes for the vision door (issue #15); None leaves photos unanswered
+    files: FileSource | None = None
     pending_ttl_minutes: int = 15  # proposal TTL (§10, §17)
 
 
@@ -952,6 +974,15 @@ async def _handle_bot_added(my_chat_member: dict[str, Any], deps: Deps) -> list[
 
 
 async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[OutboundAction]:
+    message = _claim_caption_command(message, deps)
+    image: bytes | None = None
+    if _vision_invocation(message, deps):
+        # photo bytes are fetched BEFORE the transaction below (issue #15
+        # review): a slow download must not hold a pooled DB connection or
+        # delay the webhook's 200 any longer than the model call already does
+        image = await _download_photo(message, deps)
+        if image is None:
+            return [SendMessage(chat_id=message["chat"]["id"], text=PHOTO_FETCH_FAILURE)]
     async with deps.session_factory() as session, session.begin():
         group = await ensure_group(session, message["chat"]["id"], message["chat"].get("title"))
         actor = None
@@ -1012,16 +1043,38 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
                 session, message["chat"]["id"], reply_to["message_id"]
             )
             if pending is not None:
-                return await _handle_reply_to_pending(pending, message, session, group, actor, deps)
+                if "photo" in message and image is None:
+                    # the vision door is closed (or this is an album stray):
+                    # the photo goes unanswered, but expiry burial is state
+                    # hygiene, not an answer — it still happens (issue #15 review)
+                    if pending_store.is_expired(pending):
+                        return await _bury_expired(pending, session)
+                    return []
+                return await _handle_reply_to_pending(
+                    pending, message, session, group, actor, deps, image
+                )
             if _from_this_bot(reply_to, deps.bot_username):
                 # a reply to any NON-pending bot message — an old result, the
                 # board, a dead proposal — is a fresh NL intent, exactly as if
                 # @mentioned: the mention tax lifts after the first interaction (§10.5)
+                if "photo" in message:
+                    if image is None:
+                        return []  # door closed or album stray: invisible (issue #15)
+                    return await _handle_vision(message, session, group, actor, deps, image)
                 return await _handle_nl_text(message, session, group, actor, deps)
 
         text = message.get("text", "")
         if _mentions_bot(text, deps.bot_username) and deps.llm is not None:
             return await _handle_nl_text(message, session, group, actor, deps)
+
+        # a receipt photo needs the same invocation as text (§13 privacy): a
+        # mention in its caption (the reply door is handled above)
+        if (
+            "photo" in message
+            and image is not None
+            and _mentions_bot(message.get("caption", ""), deps.bot_username)
+        ):
+            return await _handle_vision(message, session, group, actor, deps, image)
 
     return []
 
@@ -1061,23 +1114,25 @@ async def _handle_reply_to_pending(
     group: Group,
     actor: User | None,
     deps: Deps,
+    image: bytes | None = None,
 ) -> list[OutboundAction]:
     """A reply to a live proposal is a correction (§10.2): refine the parked
-    intent and edit the proposal in place — the reply's author is the actor."""
+    intent and edit the proposal in place — the reply's author is the actor.
+    image is the reply's photo, already fetched (issue #15): the vision refine
+    MERGES it into the parked intent; the caption is the correction text."""
     assert deps.llm is not None and pending.message_id is not None
     if actor is None:
         return []  # anonymous admins can't correct, like they can't propose
     if pending_store.is_expired(pending):
         # expiry is computed on read (§10.4); no resend dead-end: the reply that
         # discovers it buries the proposal AND is processed as a fresh intent
-        buried = EditMessage(
-            chat_id=pending.chat_id,
-            message_id=pending.message_id,
-            text="⌛ Expired — nothing was recorded.",
-        )
-        await session.delete(pending)
-        return [buried, *await _handle_nl_text(message, session, group, actor, deps)]
-    correction = _strip_bot_mention(message.get("text", ""), deps.bot_username)
+        buried = await _bury_expired(pending, session)
+        if image is not None:
+            return [*buried, *await _handle_vision(message, session, group, actor, deps, image)]
+        return [*buried, *await _handle_nl_text(message, session, group, actor, deps)]
+    correction = _strip_bot_mention(
+        message.get("text", "") or message.get("caption", ""), deps.bot_username
+    )
     ledger = await session.get_one(Ledger, pending.ledger_id)  # the PINNED ledger (§10)
     # when the proposal is waiting on a pick, the reply may be the answer (§13):
     # hand the model the open slot's candidates as ready-to-echo pinned refs
@@ -1107,7 +1162,7 @@ async def _handle_reply_to_pending(
             for e in slot.candidates[:EXPENSE_PICK_CAP]
         ]
     try:
-        wire = await deps.llm.refine(pending.intent_json, correction, candidates)
+        wire = await deps.llm.refine(pending.intent_json, correction, candidates, image=image)
     except LLMUnavailable:
         # a transport failure is NOT the user's sentence (issue #13 grill), and
         # it is no reason to touch the proposal either
@@ -1192,10 +1247,7 @@ async def _handle_reply_to_pending(
 async def _handle_nl_text(
     message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> list[OutboundAction]:
-    """The NL text path (§12): extract -> propose; nothing commits until Confirm (§0.7).
-
-    The savepoint scopes a rejection's rollback to the NL handling itself, like
-    _run_command: author registration earlier in the transaction still commits."""
+    """The NL text path (§12): extract -> propose; nothing commits until Confirm (§0.7)."""
     assert deps.llm is not None
     chat_id = message["chat"]["id"]
     stripped = _strip_bot_mention(message.get("text", ""), deps.bot_username)
@@ -1213,6 +1265,21 @@ async def _handle_nl_text(
                 ),
             )
         ]
+    return await _run_fresh_wire(wire, message, session, group, actor, deps)
+
+
+async def _run_fresh_wire(
+    wire: Any,
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+    deps: Deps,
+) -> list[OutboundAction]:
+    """A fresh extraction's shared tail (text and vision doors alike): the
+    savepoint scopes a rejection's rollback to the NL handling itself, like
+    _run_command — author registration earlier in the transaction still commits."""
+    chat_id = message["chat"]["id"]
     try:
         async with session.begin_nested():
             return await _run_nl_intent(wire, message, session, group, actor, deps)
@@ -1222,6 +1289,126 @@ async def _handle_nl_text(
         return [SendMessage(chat_id=chat_id, text=ambiguous_guidance(ambiguous.ref))]
     except (Rejection, ValueError) as exc:
         return [SendMessage(chat_id=chat_id, text=str(exc))]
+
+
+def _vision_door_open(deps: Deps) -> bool:
+    """Photos are invisible unless BOTH a vision-capable LLM and a file source
+    are wired (issue #15 grill) — exactly like text mentions with no LLM."""
+    return deps.llm is not None and deps.llm.supports_vision and deps.files is not None
+
+
+def _claim_caption_command(message: dict[str, Any], deps: Deps) -> dict[str, Any]:
+    """A slash command typed as a photo caption is deterministic input: surface
+    it as the message's text so the command path claims it, never the fuzzy
+    vision door (issue #15 review). A caption that is no known command of ours
+    stays a caption."""
+    caption = message.get("caption", "")
+    if "text" in message or not caption.startswith("/"):
+        return message
+    command = _command_of(caption, deps.bot_username)
+    if command != "start" and command not in _RUNNERS:
+        return message
+    return {**message, "text": caption, "entities": message.get("caption_entities", [])}
+
+
+def _album_stray(message: dict[str, Any]) -> bool:
+    """A media group (album) arrives as one update per photo, so reading every
+    item would run vision N times for one user action (issue #15 review). Only
+    the captioned item speaks for an album; caption-less items are invisible."""
+    return "media_group_id" in message and "caption" not in message
+
+
+def _vision_invocation(message: dict[str, Any], deps: Deps) -> bool:
+    """True when this photo will enter a vision door, so its bytes are needed
+    (§13 invocation rules: a caption mention, or a reply to this bot)."""
+    if "photo" not in message or "text" in message or not _vision_door_open(deps):
+        return False
+    if _album_stray(message):
+        return False
+    reply_to = message.get("reply_to_message")
+    if reply_to is not None and _from_this_bot(reply_to, deps.bot_username):
+        return True
+    return _mentions_bot(message.get("caption", ""), deps.bot_username)
+
+
+async def _download_photo(message: dict[str, Any], deps: Deps) -> bytes | None:
+    assert deps.files is not None  # _vision_invocation checked the door
+    largest = _largest_photo(message)
+    if largest is None:
+        return None  # malformed photo array: nothing usable to fetch
+    return await deps.files.download_file(largest["file_id"])
+
+
+def _largest_photo(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Telegram sends several compressed sizes of one photo; the largest reads
+    best (issue #15). Sizes usually arrive smallest-first, but pick by area.
+    None when the array is empty or no size carries a file_id (forged/malformed
+    update — the webhook validates only the secret header, issue #15 review)."""
+    sizes = [
+        size for size in cast(list[dict[str, Any]], message.get("photo") or []) if "file_id" in size
+    ]
+    if not sizes:
+        return None
+    return max(sizes, key=lambda size: size.get("width", 0) * size.get("height", 0))
+
+
+async def _bury_expired(pending: PendingIntent, session: AsyncSession) -> list[OutboundAction]:
+    """Expiry discovered by a reply (§10.4): mark the proposal dead, drop the row."""
+    actions: list[OutboundAction] = []
+    if pending.message_id is not None:
+        actions.append(
+            EditMessage(
+                chat_id=pending.chat_id,
+                message_id=pending.message_id,
+                text="⌛ Expired — nothing was recorded.",
+            )
+        )
+    await session.delete(pending)
+    return actions
+
+
+async def _handle_vision(
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+    deps: Deps,
+    image: bytes,
+) -> list[OutboundAction]:
+    """The receipt-photo door (issue #15): extract_vision -> the identical
+    propose loop as text (§0.7); a photo never commits directly. The image
+    bytes were fetched before the transaction opened."""
+    assert deps.llm is not None
+    chat_id = message["chat"]["id"]
+    caption = _strip_bot_mention(message.get("caption", ""), deps.bot_username)
+    try:
+        wire = await deps.llm.extract_vision(image, caption)
+    except LLMUnavailable:
+        return [
+            SendMessage(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ I couldn't reach my vision model just now — try again in "
+                    'a moment, or log it as text, e.g. "I paid 40 for dinner".'
+                ),
+            )
+        ]
+    if not isinstance(wire, WireAddExpense | WireSettleUp | WireUnknown):
+        # a photo only ever means money moving (§12): the restriction lives in
+        # the prompt, but the model is never trusted to widen its own door (§0)
+        wire = WireUnknown(reason=f"vision produced a non-photo kind: {wire.kind}")
+    if isinstance(wire, WireUnknown):
+        # "try rephrasing" makes no sense for a photo (issue #15 grill)
+        return [
+            SendMessage(
+                chat_id=chat_id,
+                text=(
+                    "🤷 I couldn't read that receipt — tell me the amount and what "
+                    'it was for instead, e.g. "I paid 40 for dinner".'
+                ),
+            )
+        ]
+    return await _run_fresh_wire(wire, message, session, group, actor, deps)
 
 
 async def _run_nl_intent(

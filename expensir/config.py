@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None  # provider-specific id; verify in the dashboard (§1)
+    # the receipt-photo door (issue #15): a vision-capable model id on the SAME
+    # endpoint. Unset = photos are left unanswered; text NL is unaffected.
+    llm_vision_model: str | None = None
     # cloud providers answer in <30s; a local model (Ollama) can be far slower,
     # especially on a cold load — raise this for local dev, keep it tight in prod
     # so a hung call can't block a webhook for minutes (§12).
@@ -29,7 +32,13 @@ class Settings(BaseSettings):
     pending_ttl_minutes: int = 15  # proposal TTL (§10, §17)
 
     @field_validator(
-        "public_url", "operator_user_id", "llm_base_url", "llm_api_key", "llm_model", mode="before"
+        "public_url",
+        "operator_user_id",
+        "llm_base_url",
+        "llm_api_key",
+        "llm_model",
+        "llm_vision_model",
+        mode="before",
     )
     @classmethod
     def _blank_env_value_means_unset(cls, value: object) -> object:

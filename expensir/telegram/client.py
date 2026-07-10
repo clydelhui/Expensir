@@ -26,6 +26,8 @@ class TelegramClient(Protocol):
 
     async def pin_chat_message(self, chat_id: int, message_id: int) -> Any: ...
 
+    async def download_file(self, file_id: str) -> bytes | None: ...
+
 
 class PollingTelegramClient(TelegramClient, Protocol):
     async def get_updates(self, offset: int, timeout: int) -> list[JsonDict]: ...
@@ -39,6 +41,7 @@ class HttpxTelegramClient:
         api_base: str = "https://api.telegram.org",
     ):
         self._base = f"{api_base}/bot{bot_token}"
+        self._file_base = f"{api_base}/file/bot{bot_token}"
         self._http = http or httpx.AsyncClient(timeout=30)
 
     async def send_message(
@@ -93,6 +96,21 @@ class HttpxTelegramClient:
             "getUpdates", {"offset": offset, "timeout": timeout}, http_timeout=timeout + 10
         )
         return cast(list[JsonDict], result)
+
+    async def download_file(self, file_id: str) -> bytes | None:
+        """getFile then fetch the bytes (§13, ~20 MB inbound). None when either
+        step fails — the vision door replies transiently instead of crashing
+        (FileSource contract, issue #15). The tokenized file URL stays HERE:
+        callers get bytes, never a URL that embeds the bot token."""
+        try:
+            info = await self._call("getFile", {"file_id": file_id})
+            response = await self._http.get(f"{self._file_base}/{info['file_path']}")
+            response.raise_for_status()
+        except (httpx.HTTPError, RuntimeError, KeyError, ValueError):
+            # ValueError covers json.JSONDecodeError: a 200 with a non-JSON
+            # body (proxy, truncation) must still keep the None contract
+            return None
+        return response.content
 
     async def _call(self, method: str, payload: JsonDict, http_timeout: float | None = None) -> Any:
         response = await self._http.post(

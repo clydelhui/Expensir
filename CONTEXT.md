@@ -101,12 +101,16 @@ _Avoid_: dump, snapshot (reserved for the pre-import safety snapshot)
 **Intent**:
 The single shared contract every input (slash command, natural language, receipt photo) is parsed into before anything downstream runs. The parser is never the source of truth for math or persistence.
 
+**Receipt photo**:
+A photo addressed to the bot — a mention in its caption, or sent as a reply to a bot message — read by the vision model into the same intent contract as text. It can only mean money moving: an expense or a settlement; anything else it reads as unknown. Always fuzzy, so it always proposes — a photo never commits directly. The caption steers the reading (who shared it, what it was for); the sender is the payer unless the caption says otherwise; a currency is taken from the receipt only when unambiguous, else the ledger's logging currency fills in. A caption that is a slash command makes the message a command, not a receipt photo. Within an album, only the captioned photo speaks; a photo with neither mention nor reply is ignored.
+_Avoid_: OCR (the mechanism, not the thing), image / attachment (a document upload is a Backup, never a receipt)
+
 **Proposal**:
 A rendered summary of a fuzzy intent (from NL/OCR, or an ambiguous reference) shown with Confirm/Cancel, awaiting a tap. Its intent is stored unresolved and re-resolved at confirm time, but it is pinned to the ledger it was proposed against — confirming commits there even if the group's active ledger changed meanwhile. Any member may confirm, cancel, or refine it (the usual anyone-may-act trust model, with Undo as the guardrail); a first-person reference ("me", "I") means the author of the message that introduced it — the proposer for the original text, the replier for a correction — and a confirm tap never re-anchors it, while the action audits the presser as the one who committed it. A proposal is live until confirmed, cancelled, or expired — then it is dead. A reply to a live proposal is a correction; a reply to a dead one (or to any other bot message, board included) starts a fresh intent — there is no resend dead-end.
 _Avoid_: draft, preview
 
 **Correction**:
-A reply to a live proposal that rewrites its intent in place. Any member may correct, and a correction may change what is proposed entirely — an expense into a settlement — but only ever to another mutation: a reply that turns out to be a read is answered inline, and one the bot cannot read as a correction is met with guidance; in both cases the proposal stands untouched. First-person references in a correction mean the correction's author, not the original proposer. A successful correction keeps the proposal live longer.
+A reply — text or receipt photo — to a live proposal that rewrites its intent in place. Any member may correct, and a correction may change what is proposed entirely — an expense into a settlement — but only ever to another mutation: a reply that turns out to be a read is answered inline, and one the bot cannot read as a correction is met with guidance; in both cases the proposal stands untouched. A photo correction merges, never restarts: what the receipt shows updates the proposal, and what it doesn't show survives from the thread so far. First-person references in a correction mean the correction's author, not the original proposer. A successful correction keeps the proposal live longer.
 _Avoid_: edit (reserved for editing a committed expense), amendment
 
 **Pick-list**:

@@ -96,6 +96,27 @@ Examples:
 """
 
 
+VISION_ADDENDUM = """\
+
+You are reading a PHOTO — a receipt or a payment/transfer screenshot — plus an \
+optional caption from its sender. From a photo you may ONLY emit "add_expense" \
+(a receipt: someone paid for something shared), "settle_up" (a payment screenshot: \
+money moving between two people), or "unknown" — never any other kind.
+
+- The sender sent the photo: the payer (or the "from" side) is "me" unless the \
+caption says otherwise.
+- The caption steers the reading — who shared it, what it was for, anything that \
+overrides what you see.
+- "amount": the printed TOTAL (after tax and service), copied exactly as printed.
+- "description": the merchant or what was bought, short ("Ichiran Ramen").
+- "occurred_on": the printed date when clearly legible, else null.
+- "currency": ONLY when the receipt is unambiguous — an explicit ISO code, an \
+unambiguous symbol ("€" -> "EUR"), or a country-qualified one ("S$" -> "SGD"). \
+A bare "$" or "¥" is ambiguous: use null, never guess from context.
+- Unreadable, or not a receipt or payment screenshot: emit "unknown".
+"""
+
+
 REFINE_ADDENDUM = """\
 
 You are refining an ALREADY-PARSED proposal: the user replied to it with a correction. \
@@ -113,18 +134,49 @@ if it is not about this proposal at all emit "unknown".
 """
 
 
-def extraction_messages(text: str) -> list[dict[str, str]]:
+def extraction_messages(text: str) -> list[dict[str, Any]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": text},
     ]
 
 
+def vision_extraction_messages(image_data_url: str, caption: str) -> list[dict[str, Any]]:
+    """The receipt-photo door's prompt (issue #15): the image as an OpenAI-compat
+    data-URL part, the mention-stripped caption as the steering text part."""
+    text = (
+        f"Caption from the sender:\n{caption}" if caption else "No caption — read the photo alone."
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT + VISION_ADDENDUM},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+                {"type": "text", "text": text},
+            ],
+        },
+    ]
+
+
+VISION_REFINE_NOTE = """\
+
+The correction is (or includes) a PHOTO, attached to this message. Read it with \
+the photo rules above and MERGE it into the proposed intent: fields the photo \
+clearly shows (amount, unambiguous currency, date, description) replace the \
+prior values; every field it does not show carries over unchanged.
+"""
+
+
 def refine_messages(
-    prior_intent: dict[str, Any], correction: str, candidates: list[str] | None = None
-) -> list[dict[str, str]]:
+    prior_intent: dict[str, Any],
+    correction: str,
+    candidates: list[str] | None = None,
+    image_data_url: str | None = None,
+) -> list[dict[str, Any]]:
     """The reply-to-correct loop's prompt (§10.2): prior intent + correction ->
-    the full refined intent; candidates are the open pick-list slot's choices."""
+    the full refined intent; candidates are the open pick-list slot's choices;
+    image_data_url is a photo sent as the correction (issue #15, merges)."""
     picking = (
         "The proposal is currently asking which of several matches was meant. "
         'The choices, each as "<ref> = label", in order:\n'
@@ -141,15 +193,29 @@ def refine_messages(
         f"{picking}"
         f"Correction reply:\n{correction}"
     )
+    if image_data_url is None:
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT + REFINE_ADDENDUM},
+            {"role": "user", "content": user},
+        ]
     return [
-        {"role": "system", "content": SYSTEM_PROMPT + REFINE_ADDENDUM},
-        {"role": "user", "content": user},
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT + VISION_ADDENDUM + REFINE_ADDENDUM + VISION_REFINE_NOTE,
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+                {"type": "text", "text": user},
+            ],
+        },
     ]
 
 
 def retry_messages(
-    messages: list[dict[str, str]], bad_reply: str, error: str
-) -> list[dict[str, str]]:
+    messages: list[dict[str, Any]], bad_reply: str, error: str
+) -> list[dict[str, Any]]:
     """Show the model its own invalid reply and what was wrong (issue #13 grill)."""
     return [
         *messages,

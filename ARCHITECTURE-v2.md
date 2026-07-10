@@ -151,7 +151,7 @@ expensir/
 │   ├── intents/
 │   │   ├── schema.py            # the shared Intent contract (Pydantic discriminated union)
 │   │   ├── commands.py          # deterministic slash parsers (CPU, no LLM)
-│   │   └── nl.py                # LLM text + vision -> Intent; refine(intent, correction)
+│   │   └── nl.py                # LLM text + vision -> Intent; refine(intent, correction[, image])
 │   ├── llm/
 │   │   ├── base.py              # LLMClient protocol: extract_text / extract_vision / refine
 │   │   ├── openai_compat.py     # one client for every OpenAI-compatible provider (ADR-0010)
@@ -442,7 +442,7 @@ Telegram update (webhook push OR getUpdates poll)
   -> core.handler.dispatch(update_dict)            [transport-agnostic from here down]
   -> core.router classifies into exactly ONE:
        callback_query .................. confirm/cancel · undo/redo · board-settle · split-type/picker · pick-list
-       reply to a LIVE pending proposal  nl.refine(pending, text) -> edit proposal in place
+       reply to a LIVE pending proposal  nl.refine(pending, text-or-photo) -> edit proposal in place
        reply to any OTHER bot message .. new NL intent (as if @mentioned) — incl. expired proposals & board
        slash command ................... intents.commands (CPU parse)
        @mention (text) ................. intents.nl.extract_text -> Intent
@@ -653,10 +653,12 @@ Active-ledger invariant maintenance (ADR-0004):
    state is deferred to confirm, so a cancelled proposal leaves nothing behind. (Unknown-member
    rejection and ambiguous-reference pick-lists still happen at propose time via read-only preview,
    §11, §13.)
-2. **Correcting a LIVE proposal** — the user **replies** with free text. The router matches
-   `reply_to_message.message_id` to a live pending intent → `nl.refine(pending, text)` → **edit the
-   proposal in place**. A successful refine **refreshes `expires_at`** so active editing stays in
-   place. Repeat as needed. (Reading A, discussion resolved.)
+2. **Correcting a LIVE proposal** — the user **replies** with free text or a receipt photo. The
+   router matches `reply_to_message.message_id` to a live pending intent → `nl.refine(pending,
+   text[, image])` → **edit the proposal in place**. A photo correction **merges** (issue #15
+   grill): what the receipt shows updates the intent, everything else — including pick-list pins —
+   survives; the caption is the correction text. A successful refine **refreshes `expires_at`** so
+   active editing stays in place. Repeat as needed. (Reading A, discussion resolved.)
 3. **Confirm** → take the per-group lock, **re-resolve + re-validate** the intent in the transaction
    **against the pinned ledger** — a concurrent `/switch` never redirects a pending proposal; if the
    pinned ledger was archived meanwhile, the confirm fails re-validation — then `apply_intent`, then
@@ -770,6 +772,18 @@ Routing rules: **reads run immediately**; **NL/OCR mutations always propose+conf
 Ambiguous resolution triggers a pick-list (§10). `nl.refine(prior_intent_json, correction_text)`
 returns a refined intent for the reply-to-correct loop.
 
+**Vision (issue #15 grill):** a photo may only extract `add_expense`, `settle_up`, or `unknown` —
+receipts and payment screenshots mean money moving, nothing else. The restriction lives in the
+prompt AND is enforced app-side: any other kind from the vision model is treated as unknown (§0 —
+the parser never widens its own door). The sender is the payer unless the caption says otherwise;
+a currency is emitted only when the receipt is unambiguous (explicit ISO code, `€`, `S$`) — bare
+`$`/`¥` stays null and resolves to the logging currency app-side. An amountless `settle_up` from a
+photo is the settle sheet, exactly as from text (ADR-0007). A slash command typed as a caption is
+deterministic input — it runs the command path, never vision. Within an album (media group), only
+the captioned item is read: caption-less items are invisible, so one user action never runs vision
+N times. Photo bytes are fetched before the handler's DB transaction opens — network I/O never
+holds a pooled connection.
+
 ---
 
 ## 13. Telegram specifics & gotchas (`telegram/`)
@@ -826,6 +840,8 @@ LLM_BASE_URL=                # any OpenAI-compatible endpoint (ADR-0010), e.g. C
                              #   https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1
 LLM_API_KEY=
 LLM_MODEL=                   # provider-specific model id — verify in the provider dashboard (§1)
+LLM_VISION_MODEL=            # vision model id on the SAME endpoint (issue #15); unset = the
+                             #   receipt-photo door is closed, photos are left unanswered
 GEMINI_API_KEY=              # only if swapping the vision path to Gemini's native API (§15.11)
 
 FX_API_BASE=https://api.frankfurter.dev   # no key; ECB daily; same-day cache (§7.5); DISPLAY ONLY

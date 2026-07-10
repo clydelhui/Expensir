@@ -115,3 +115,34 @@ def test_llm_settings_read_the_endpoint_triple(monkeypatch):
     assert settings.llm_api_key == "cf-token"
     assert settings.llm_model == "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
     assert settings.pending_ttl_minutes == 5
+
+
+def test_vision_model_is_optional_and_blank_means_unset(monkeypatch):
+    """LLM_VISION_MODEL unset or blank -> the vision door stays closed (issue #15)."""
+    monkeypatch.setenv("MODE", "poll")
+    monkeypatch.setenv("BOT_TOKEN", "123:abc")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "s")
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite://")
+
+    assert Settings().llm_vision_model is None
+    monkeypatch.setenv("LLM_VISION_MODEL", "")
+    assert Settings().llm_vision_model is None
+    monkeypatch.setenv("LLM_VISION_MODEL", "some/vision-model")
+    assert Settings().llm_vision_model == "some/vision-model"
+
+
+def test_make_llm_passes_the_vision_model_through(monkeypatch):
+    """__main__ wiring: LLM_VISION_MODEL flips supports_vision on the one client."""
+    from expensir.__main__ import _make_llm
+
+    monkeypatch.setenv("MODE", "poll")
+    monkeypatch.setenv("BOT_TOKEN", "123:abc")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "s")
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite://")
+    monkeypatch.setenv("LLM_BASE_URL", "https://provider.example/v1")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("LLM_MODEL", "text-model")
+
+    assert _make_llm(Settings()).supports_vision is False
+    monkeypatch.setenv("LLM_VISION_MODEL", "vision-model")
+    assert _make_llm(Settings()).supports_vision is True

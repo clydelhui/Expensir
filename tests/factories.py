@@ -112,6 +112,61 @@ def joined_members_update(
     }
 
 
+def reply_stub(
+    message_id: int,
+    chat_id: int = -100500,
+    title: str | None = "Japan Trip",
+    by: dict | None = None,
+) -> dict:
+    """The reply_to_message snapshot Telegram embeds in a reply (bot by default)."""
+    return {
+        "message_id": message_id,
+        "chat": group_chat(chat_id, title),
+        "from": by or BOT_USER,
+        "date": 1751400000,
+    }
+
+
+def photo_update(
+    update_id: int = 2,
+    chat_id: int = -100500,
+    title: str | None = "Japan Trip",
+    caption: str | None = None,
+    from_user: dict | None = None,
+    message_id: int = 10,
+    reply_to_message_id: int | None = None,
+    reply_to_from: dict | None = None,
+    file_id: str = "photo-big-1",
+    sizes: list[dict] | None = None,
+    media_group_id: str | None = None,
+) -> dict:
+    """A photo message: several PhotoSizes as Telegram sends them (smallest
+    first, each with its own file_id) and a caption instead of text."""
+    message = {
+        "message_id": message_id,
+        "chat": group_chat(chat_id, title),
+        "from": from_user or user(),
+        "date": 1751400000,
+        "photo": (
+            sizes
+            if sizes is not None
+            else [
+                {"file_id": "thumb-1", "file_unique_id": "u-t", "width": 90, "height": 120},
+                {"file_id": file_id, "file_unique_id": "u-b", "width": 900, "height": 1200},
+            ]
+        ),
+    }
+    if caption is not None:
+        message["caption"] = caption
+    if media_group_id is not None:
+        message["media_group_id"] = media_group_id
+    if reply_to_message_id is not None:
+        message["reply_to_message"] = reply_stub(
+            reply_to_message_id, chat_id, title, by=reply_to_from
+        )
+    return {"update_id": update_id, "message": message}
+
+
 def message_update(
     update_id: int = 2,
     chat_id: int = -100500,
@@ -133,10 +188,7 @@ def message_update(
     if entities is not None:
         message["entities"] = entities
     if reply_to_message_id is not None:
-        message["reply_to_message"] = {
-            "message_id": reply_to_message_id,
-            "chat": group_chat(chat_id, title),
-            "from": reply_to_from or BOT_USER,
-            "date": 1751400000,
-        }
+        message["reply_to_message"] = reply_stub(
+            reply_to_message_id, chat_id, title, by=reply_to_from
+        )
     return {"update_id": update_id, "message": message}

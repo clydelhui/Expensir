@@ -1,0 +1,138 @@
+[
+  {
+    "name": "receipt_with_explicit_currency",
+    "image": "sample-receipt.jpg",
+    "caption": "",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"add_expense\", \"payer_ref\": \"me\", \"amount\": \"1690\", \"currency\": \"JPY\", \"description\": \"Ichiran Ramen\", \"occurred_on\": \"2026-07-08\", \"split_type\": \"equal\", \"participants\": [], \"confidence\": 0.85}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": { "prompt_tokens": 1400, "completion_tokens": 70, "total_tokens": 1470 }
+    },
+    "expected": {
+      "kind": "add_expense",
+      "amount": "1690",
+      "currency": "JPY",
+      "description": "Ichiran Ramen",
+      "occurred_on": "2026-07-08"
+    }
+  },
+  {
+    "name": "ambiguous_dollar_sign_leaves_currency_null",
+    "image": "sample-receipt.jpg",
+    "caption": "",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"add_expense\", \"payer_ref\": \"me\", \"amount\": \"34.50\", \"currency\": null, \"description\": \"groceries\", \"occurred_on\": null, \"split_type\": \"equal\", \"participants\": [], \"confidence\": 0.7}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": { "prompt_tokens": 1400, "completion_tokens": 65, "total_tokens": 1465 }
+    },
+    "expected": {
+      "kind": "add_expense",
+      "amount": "34.50",
+      "currency": null
+    }
+  },
+  {
+    "name": "caption_steers_the_split",
+    "image": "sample-receipt.jpg",
+    "caption": "dinner, split with Sam",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"add_expense\", \"payer_ref\": \"me\", \"amount\": \"62.00\", \"currency\": null, \"description\": \"dinner\", \"occurred_on\": null, \"split_type\": \"equal\", \"participants\": [{\"user_ref\": \"me\"}, {\"user_ref\": \"Sam\"}], \"confidence\": 0.8}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": { "prompt_tokens": 1410, "completion_tokens": 80, "total_tokens": 1490 }
+    },
+    "expected": {
+      "kind": "add_expense",
+      "amount": "62.00",
+      "description": "dinner",
+      "split_type": "equal"
+    }
+  },
+  {
+    "name": "transfer_screenshot_settles",
+    "image": "sample-receipt.jpg",
+    "caption": "paid Sam back",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"settle_up\", \"from_ref\": \"me\", \"to_ref\": \"Sam\", \"amount\": \"20\", \"currency\": \"SGD\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": { "prompt_tokens": 1405, "completion_tokens": 40, "total_tokens": 1445 }
+    },
+    "expected": {
+      "kind": "settle_up",
+      "amount": "20",
+      "currency": "SGD"
+    }
+  },
+  {
+    "name": "unreadable_photo_is_unknown",
+    "image": "sample-receipt.jpg",
+    "caption": "",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"unknown\", \"reason\": \"not a receipt or payment screenshot\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": { "prompt_tokens": 1395, "completion_tokens": 20, "total_tokens": 1415 }
+    },
+    "expected": {
+      "kind": "unknown"
+    }
+  }
+]
