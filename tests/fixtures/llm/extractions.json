@@ -264,6 +264,36 @@
     }
   },
   {
+    "name": "delete_by_description",
+    "utterance": "delete the dinner one",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"delete_expense\", \"expense_id\": null, \"match\": \"dinner\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "delete_expense",
+      "expense_id": null,
+      "match": "dinner"
+    }
+  },
+  {
     "name": "edit_description",
     "utterance": "rename #7 to team lunch",
     "response": {
@@ -291,6 +321,37 @@
       "kind": "edit_expense",
       "expense_id": 7,
       "description": "team lunch"
+    }
+  },
+  {
+    "name": "edit_by_description",
+    "utterance": "rename the taxi ride to airport run",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"edit_expense\", \"expense_id\": null, \"match\": \"taxi ride\", \"description\": \"airport run\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "edit_expense",
+      "expense_id": null,
+      "match": "taxi ride",
+      "description": "airport run"
     }
   },
   {

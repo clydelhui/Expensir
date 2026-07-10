@@ -65,5 +65,35 @@ def confirm_keyboard(pending_id: int) -> InlineKeyboard:
     }
 
 
+def pick_keyboard(pending_id: int, choices: list[tuple[int, str]]) -> InlineKeyboard:
+    """One ambiguous slot at a time (§10): a button per candidate, plus Cancel.
+
+    Data stays ids-only within the 64-byte cap: the tap handler re-derives the
+    open slot, so the ref itself never rides in the callback."""
+    return {
+        "inline_keyboard": [
+            *(
+                [{"text": label, "callback_data": f"v1:pick:{pending_id}:{user_id}"}]
+                for user_id, label in choices
+            ),
+            [{"text": "✖ Cancel", "callback_data": f"v1:cancel:{pending_id}"}],
+        ]
+    }
+
+
+def expense_pick_keyboard(pending_id: int, choices: list[tuple[int, str]]) -> InlineKeyboard:
+    """The expense flavour of the pick stage (§11 tertiary, §13): a button per
+    candidate expense, plus Cancel. Same ids-only discipline as v1:pick."""
+    return {
+        "inline_keyboard": [
+            *(
+                [{"text": label, "callback_data": f"v1:pickx:{pending_id}:{expense_id}"}]
+                for expense_id, label in choices
+            ),
+            [{"text": "✖ Cancel", "callback_data": f"v1:cancel:{pending_id}"}],
+        ]
+    }
+
+
 def redo_keyboard(action_id: int) -> InlineKeyboard:
     return {"inline_keyboard": [[{"text": "↪️ Redo", "callback_data": f"v1:redo:{action_id}"}]]}

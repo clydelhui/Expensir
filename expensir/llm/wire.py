@@ -49,12 +49,14 @@ class WireShowBalance(BaseModel):
 class WireDeleteExpense(BaseModel):
     kind: Literal["delete_expense"] = "delete_expense"
     expense_id: int | None = None  # a bare #id in the text; None -> the reply names it (§11)
+    match: str | None = None  # descriptive words ("the dinner one" -> "dinner"), §11 tertiary
     confidence: float | None = None
 
 
 class WireEditExpense(BaseModel):
     kind: Literal["edit_expense"] = "edit_expense"
     expense_id: int | None = None  # a bare #id in the text; None -> the reply names it (§11)
+    match: str | None = None  # descriptive words naming the expense, §11 tertiary
     description: str | None = None
     occurred_on: str | None = None  # ISO date; DISPLAY ONLY (§7.2)
     confidence: float | None = None

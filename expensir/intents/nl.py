@@ -12,6 +12,8 @@ from expensir.domain.money import to_minor
 from expensir.intents.schema import (
     AddExpense,
     ArchiveLedger,
+    DeleteExpense,
+    EditExpense,
     Intent,
     NewLedger,
     SetHomeCurrency,
@@ -26,6 +28,8 @@ from expensir.intents.schema import (
 from expensir.llm.wire import (
     WireAddExpense,
     WireArchiveLedger,
+    WireDeleteExpense,
+    WireEditExpense,
     WireNewLedger,
     WireResult,
     WireSetHomeCurrency,
@@ -42,6 +46,69 @@ from expensir.llm.wire import (
 class ConvertedIntent:
     intent: Intent
     rounded_from: str | None  # the stated amount, when to_minor rounded it (§3, visible)
+
+
+def pin_me(intent: Intent, user_id: int) -> Intent:
+    """Pin first-person refs to the member who uttered them (issue #14 grill).
+
+    "me" anchors to the author of the message that INTRODUCED it — the proposer
+    for the original text, the replier for a correction — so a parked intent
+    stores "id:<n>" instead, and a later reply or confirm by someone else can
+    never re-anchor it. Departure doesn't unpin: id refs stay resolvable (§10)."""
+    pinned = f"id:{user_id}"
+    if isinstance(intent, AddExpense):
+        return intent.model_copy(
+            update={
+                "payer_ref": pinned if intent.payer_ref == "me" else intent.payer_ref,
+                "participants": [
+                    p.model_copy(update={"user_ref": pinned}) if p.user_ref == "me" else p
+                    for p in intent.participants
+                ],
+            }
+        )
+    if isinstance(intent, SettleUp):
+        return intent.model_copy(
+            update={
+                "from_ref": pinned if intent.from_ref == "me" else intent.from_ref,
+                "to_ref": pinned if intent.to_ref == "me" else intent.to_ref,
+            }
+        )
+    return intent  # no other proposable kind carries member refs
+
+
+def pin_ref(intent: Intent, ref: str, user_id: int) -> Intent:
+    """Pin one ambiguous reference to the chosen member (§13, issue #14 grill).
+
+    One slot per distinct string: every occurrence of the ref in the intent —
+    payer and participant alike — pins to the same person."""
+    pinned = f"id:{user_id}"
+
+    def sub(current: str) -> str:
+        return pinned if current == ref else current
+
+    if isinstance(intent, AddExpense):
+        return intent.model_copy(
+            update={
+                "payer_ref": sub(intent.payer_ref),
+                "participants": [
+                    p.model_copy(update={"user_ref": sub(p.user_ref)}) for p in intent.participants
+                ],
+            }
+        )
+    if isinstance(intent, SettleUp):
+        return intent.model_copy(
+            update={"from_ref": sub(intent.from_ref), "to_ref": sub(intent.to_ref)}
+        )
+    return intent
+
+
+def pin_expense(intent: Intent, expense_id: int) -> Intent:
+    """Pin the open descriptive-expense slot to the chosen expense (§13):
+    from here on the intent names one concrete #id, so a deletion in the
+    meantime fails the confirm instead of silently retargeting (§10.3)."""
+    if isinstance(intent, DeleteExpense | EditExpense):
+        return intent.model_copy(update={"expense_id": expense_id})
+    return intent
 
 
 def to_intent(
@@ -82,6 +149,23 @@ def to_intent(
     if isinstance(wire, WireSetLoggingCurrency):
         return ConvertedIntent(
             intent=SetLoggingCurrency(currency=require_known_currency(wire.currency)),
+            rounded_from=None,
+        )
+    if isinstance(wire, WireDeleteExpense):
+        # the correction path (§10.2): a reply targets the proposal, never an
+        # expense result, so only #id and the descriptive match apply here —
+        # the fresh-message door injects reply-target resolution itself (§11)
+        return ConvertedIntent(
+            intent=DeleteExpense(expense_id=wire.expense_id, match=wire.match), rounded_from=None
+        )
+    if isinstance(wire, WireEditExpense):
+        return ConvertedIntent(
+            intent=EditExpense(
+                expense_id=wire.expense_id,
+                match=wire.match,
+                description=wire.description,
+                occurred_on=wire.occurred_on,
+            ),
             rounded_from=None,
         )
     if isinstance(wire, WireUnknown):

@@ -20,7 +20,6 @@ from expensir.db.models import (
     Settlement,
     utcnow,
 )
-from expensir.llm.base import LLMUnavailable
 from expensir.llm.wire import (
     WireAddExpense,
     WireArchiveLedger,
@@ -39,7 +38,7 @@ from expensir.llm.wire import (
 )
 from expensir.transports.executor import execute
 from tests.factories import callback_update, message_update, user
-from tests.fakes import FakeLLM
+from tests.fakes import FakeLLM, UnavailableLLM
 from tests.test_executor import FakeTelegramClient
 
 ALICE = user(1001, "Alice", "alice")
@@ -254,24 +253,6 @@ async def test_a_bare_display_name_resolves_even_when_the_username_differs(deps)
     (send,) = actions
     assert "reply to correct" in send.text  # it proposed: the ref resolved
     assert "Kim" in send.text
-
-
-async def test_an_ambiguous_display_name_rejects_with_username_guidance(deps):
-    """Two members named Sam: no pick-list until slice 13 — reject with guidance."""
-    await arrange_group(deps)
-    other_sam = user(1004, "Sam", "sam_the_second")
-    await dispatch(message_update(update_id=6, text="hi", from_user=other_sam, message_id=8), deps)
-    deps.llm = FakeLLM([DINNER_WITH_SAM])
-
-    actions = await mention(deps, "I paid 40 for dinner, split with Sam")
-
-    (send,) = actions
-    assert "@" in send.text  # point at @username disambiguation
-    async with deps.session_factory() as session:
-        assert (
-            await session.execute(select(func.count()).select_from(PendingIntent))
-        ).scalar() == 0
-        assert (await session.execute(select(func.count()).select_from(Expense))).scalar() == 0
 
 
 async def test_an_nl_ledger_switch_proposes_then_commits_on_confirm(deps):
@@ -538,11 +519,6 @@ async def test_nl_setup_by_reply_proposes_then_registers_without_undo(deps):
             await session.execute(select(Identity).where(Identity.platform_user_id == 1005))
         ).scalar_one_or_none()
         assert identity is not None
-
-
-class UnavailableLLM:
-    async def extract_text(self, text: str):
-        raise LLMUnavailable("connect timeout")
 
 
 async def test_llm_outage_says_so_instead_of_blaming_the_sentence(deps):

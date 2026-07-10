@@ -1,5 +1,6 @@
 """Transport-agnostic entrypoint: dispatch(update_dict) -> list[OutboundAction] (§0.5)."""
 
+import contextlib
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from expensir.core.outbound import (
     SendMessage,
 )
 from expensir.core.sheet import sheet_view
-from expensir.db.models import Action, Group, Ledger, PendingIntent, User
+from expensir.db.models import Action, Expense, Group, Ledger, PendingIntent, User
 from expensir.domain.apply import (
     Applied,
     AppliedExpense,
@@ -31,19 +32,23 @@ from expensir.domain.apply import (
     ApplyContext,
     apply_intent,
     expense_participants,
+    sealed_expense,
     split_shares,
 )
 from expensir.domain.balances import net_positions
 from expensir.domain.currency import resolve_currency
-from expensir.domain.errors import Rejection
+from expensir.domain.errors import AmbiguousExpense, AmbiguousRef, Rejection
 from expensir.domain.identity import (
+    ambiguous_guidance,
     display_names,
     ensure_group,
     mark_left,
     register_member,
     registered_members_with_usernames,
     resolve_expense_id,
+    resolve_expense_match,
     resolve_refs,
+    usernames_of,
 )
 from expensir.domain.ledgers import find_ledger, ledgers_of
 from expensir.domain.money import fmt, to_minor
@@ -52,6 +57,8 @@ from expensir.domain.undo import ToggleDirection, toggle
 from expensir.format.keyboards import (
     InlineKeyboard,
     confirm_keyboard,
+    expense_pick_keyboard,
+    pick_keyboard,
     redo_keyboard,
     undo_keyboard,
 )
@@ -62,10 +69,12 @@ from expensir.format.render import (
     balance_reply,
     delete_reply,
     edit_reply,
+    expense_pick_stage_reply,
     expense_reply,
     join_names,
     ledgers_reply,
     members_reply,
+    pick_stage_reply,
     proposal_reply,
     settle_reply,
 )
@@ -114,12 +123,20 @@ from expensir.llm.wire import WireDeleteExpense, WireEditExpense, WireSetup, Wir
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
 # Confirm/Cancel on a proposal (§10), keyed by the pending row's id
 _CONFIRM_DATA = re.compile(r"^v1:(confirm|cancel):(\d+)$")
+# a pick-list choice (§13): pending row + chosen member; the open slot is
+# re-derived on tap, so the ref string never rides in the callback
+_PICK_DATA = re.compile(r"^v1:pick:(\d+):(\d+)$")
+# the expense flavour (§11 tertiary): pending row + chosen expense id
+_PICKX_DATA = re.compile(r"^v1:pickx:(\d+):(\d+)$")
 # the board [Settle] button (ADR-0006): tuple + shown amount as a staleness token
 _SETTLE_DATA = re.compile(r"^v1:st:(\d+):(\d+):([A-Z]{3}):(\d+)$")
 # a settle-sheet line (ADR-0007): same tuple + token, prefixed with the ledger —
 # a sheet message is not the pinned board, so the tap can't resolve it from the chat
 _SHEET_DATA = re.compile(r"^v1:sh:(\d+):(\d+):(\d+):([A-Z]{3}):(\d+)$")
 _INTENT: TypeAdapter[Intent] = TypeAdapter(Intent)
+# an expense pick-list shows only this many, newest first (issue #14 grill):
+# beyond it the message says what was dropped and points at #id
+EXPENSE_PICK_CAP = 5
 UNDONE_MARK = "\n\n↩️ Undone by "
 UNDO_POINTER = (
     "I never undo from chat — tap the ↩️ Undo button on the message that recorded it instead."
@@ -197,6 +214,12 @@ async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[O
     confirm = _CONFIRM_DATA.match(callback.get("data") or "")
     if confirm is not None:
         return await _handle_confirm_tap(callback, confirm, deps)
+    pick = _PICK_DATA.match(callback.get("data") or "")
+    if pick is not None:
+        return await _handle_pick_tap(callback, pick, deps)
+    pickx = _PICKX_DATA.match(callback.get("data") or "")
+    if pickx is not None:
+        return await _handle_pickx_tap(callback, pickx, deps)
     settle = _SETTLE_DATA.match(callback.get("data") or "")
     if settle is not None:
         return await _handle_settle_tap(callback, settle, deps)
@@ -347,6 +370,37 @@ async def _handle_confirm_tap(
             # while the consume + registration above still commit (§0.9)
             async with session.begin_nested():
                 applied = await apply_intent(intent, ctx)
+        except AmbiguousRef as ambiguous:
+            # late ambiguity (issue #14 grill): a new member made a unique ref
+            # ambiguous between propose and confirm. Commit nothing and put the
+            # proposal (back) in the pick stage — the row survives, the clock
+            # restarts, and Confirm returns once the slot is pinned (§13).
+            choices = await _pick_labels(session, ambiguous.candidates)
+            pending_store.refresh(pending, ttl_minutes=deps.pending_ttl_minutes)
+            ack.text = "Someone new matches that name — tap who you meant."
+            edit = EditMessage(
+                chat_id=chat["id"],
+                message_id=message["message_id"],
+                text=pick_stage_reply(
+                    ledger_name=ledger.name, gist=_proposal_gist(intent), ref=ambiguous.ref
+                ),
+                reply_markup=pick_keyboard(pending.id, choices),
+            )
+            return [ack, edit]
+        except AmbiguousExpense as ambiguous:
+            # same rule for a described expense that stopped being unique — or a
+            # Confirm racing a still-open expense slot: nothing commits, the
+            # proposal (re-)enters the expense pick stage (§13)
+            pending_store.refresh(pending, ttl_minutes=deps.pending_ttl_minutes)
+            ack.text = "More than one expense matches that — tap the one you meant."
+            text, markup = _expense_pick_stage(intent, ambiguous, ledger, pending.id)
+            edit = EditMessage(
+                chat_id=chat["id"],
+                message_id=message["message_id"],
+                text=text,
+                reply_markup=markup,
+            )
+            return [ack, edit]
         except Rejection as exc:
             await session.delete(pending)  # consumed: a reply starts fresh (§10.4)
             ack.text = "Nothing was recorded."
@@ -386,6 +440,143 @@ async def _handle_confirm_tap(
         reply_markup=markup,
     )
     return [ack, edit, *board]
+
+
+async def _handle_pick_tap(
+    callback: dict[str, Any], match: re.Match[str], deps: Deps
+) -> list[OutboundAction]:
+    """A pick-list choice (§13): pin the open slot to the tapped member and
+    re-render the proposal — the next open slot, or Confirm once all pinned."""
+
+    def pin(intent: Intent, slot: AmbiguousRef | AmbiguousExpense | None, chosen: int):
+        if not isinstance(slot, AmbiguousRef) or chosen not in {u.id for u in slot.candidates}:
+            return None
+        return nl.pin_ref(intent, slot.ref, chosen)
+
+    return await _handle_pick_choice(callback, match, deps, pin)
+
+
+async def _handle_pickx_tap(
+    callback: dict[str, Any], match: re.Match[str], deps: Deps
+) -> list[OutboundAction]:
+    """The expense flavour of a pick (§11 tertiary, §13): pin the descriptive
+    slot to the tapped expense and re-render — same loop, same Confirm gate."""
+
+    def pin(intent: Intent, slot: AmbiguousRef | AmbiguousExpense | None, chosen: int):
+        if not isinstance(slot, AmbiguousExpense) or chosen not in {e.id for e in slot.candidates}:
+            return None
+        return nl.pin_expense(intent, chosen)
+
+    return await _handle_pick_choice(callback, match, deps, pin)
+
+
+async def _handle_pick_choice(
+    callback: dict[str, Any],
+    match: re.Match[str],
+    deps: Deps,
+    pin: Callable[[Intent, AmbiguousRef | AmbiguousExpense | None, int], Intent | None],
+) -> list[OutboundAction]:
+    """The shared pick-tap loop (§13): re-derive the open slot, let `pin`
+    apply the choice (None = a stale keyboard), and re-render the proposal."""
+    ack = AnswerCallbackQuery(callback_query_id=callback["id"])
+    pending_id, chosen_id = int(match.group(1)), int(match.group(2))
+
+    message = callback.get("message") or {}
+    chat = message.get("chat")
+    if chat is None or chat["type"] not in ("group", "supergroup"):
+        return [ack]
+
+    async with deps.session_factory() as session, session.begin():
+        group = await ensure_group(session, chat["id"], chat.get("title"))
+        presser = await _register_author(session, group.id, callback["from"])
+        if presser is None:
+            ack.text = "I can't tell who pressed that — anonymous admins can't pick."
+            return [ack]
+        pending = await session.get(PendingIntent, pending_id)
+        if pending is None or pending.chat_id != chat["id"]:
+            ack.text = "This proposal was already handled."
+            return [ack]
+
+        if pending_store.is_expired(pending):
+            # expiry is computed on read (§10.4), on picks like on confirms
+            await session.delete(pending)
+            ack.text = "Nothing was recorded."
+            edit = EditMessage(
+                chat_id=chat["id"],
+                message_id=message["message_id"],
+                text="⌛ Expired — nothing was recorded. Send it again if it still applies.",
+            )
+            return [ack, edit]
+
+        ledger = await session.get_one(Ledger, pending.ledger_id)
+        intent = _INTENT.validate_python(pending.intent_json)
+        converted = nl.ConvertedIntent(intent=intent, rounded_from=None)
+        try:
+            slot = await _first_ambiguity(
+                intent, converted, session, group, presser, ledger, pending
+            )
+            pinned = pin(intent, slot, chosen_id)
+            if pinned is None:
+                # a stale keyboard: the slot was already pinned, or a refine changed
+                # the intent under this button — re-render what is actually open
+                ack.text = "That changed — the proposal is showing its current state."
+            else:
+                intent = pinned
+                pending.intent_json = intent.model_dump(mode="json")
+                pending_store.refresh(pending, ttl_minutes=deps.pending_ttl_minutes)
+                converted = nl.ConvertedIntent(intent=intent, rounded_from=None)
+                ack.text = "Got it."
+            text, markup = await _proposal_stage(
+                intent, converted, session, group, presser, ledger, pending
+            )
+        except (Rejection, ValueError) as exc:
+            # the proposal can no longer render (a match with no candidates left,
+            # an unknown ref surfacing after the ambiguous one): bury it like a
+            # failed confirm rather than crash into a Telegram retry loop (§0.9)
+            await session.delete(pending)  # consumed: a reply starts fresh (§10.4)
+            ack.text = "Nothing was recorded."
+            return [
+                ack,
+                EditMessage(
+                    chat_id=chat["id"],
+                    message_id=message["message_id"],
+                    text=f"⚠️ That changed while you were deciding — nothing was recorded. {exc}",
+                ),
+            ]
+
+    return [
+        ack,
+        EditMessage(
+            chat_id=chat["id"],
+            message_id=message["message_id"],
+            text=text,
+            reply_markup=markup,
+        ),
+    ]
+
+
+async def _first_ambiguity(
+    intent: Intent,
+    converted: nl.ConvertedIntent,
+    session: AsyncSession,
+    group: Group,
+    actor: User,
+    ledger: Ledger,
+    pending: PendingIntent,
+) -> AmbiguousRef | AmbiguousExpense | None:
+    """The proposal's first open pick slot (§13, one at a time) — a member ref
+    or a descriptive expense — re-derived on read like expiry: pick-list state
+    is never stored."""
+    try:
+        if isinstance(intent, AddExpense):
+            await _expense_proposal_text(
+                intent, converted, session, group, actor, ledger, pending.seed
+            )
+        else:
+            await _proposal_summary(intent, session, group, actor, ledger)
+    except (AmbiguousRef, AmbiguousExpense) as ambiguous:
+        return ambiguous
+    return None
 
 
 def _committed_text(intent: Intent, applied: Applied, *, pinned_ledger_name: str) -> str:
@@ -721,7 +912,12 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
             return [SendMessage(chat_id=message["chat"]["id"], text=text)]
         runner = _RUNNERS.get(command or "")
         if runner is not None:
-            reply = await _run_command(runner, message, session, group, actor)
+            try:
+                reply = await _run_command(runner, message, session, group, actor)
+            except AmbiguousRef as ambiguous:
+                # ambiguous reference resolution makes ANY intent fuzzy (§0.7):
+                # the slash door parks a pick-stage proposal too (§13)
+                return await _park_ambiguous_slash(ambiguous, message, session, group, actor, deps)
             markup = reply.markup
             board: list[OutboundAction] = []
             if reply.undo_action_id is not None:
@@ -741,11 +937,187 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
                 *board,
             ]
 
+        reply_to = message.get("reply_to_message")
+        if reply_to is not None and deps.llm is not None:
+            pending = await pending_store.by_message(
+                session, message["chat"]["id"], reply_to["message_id"]
+            )
+            if pending is not None:
+                return await _handle_reply_to_pending(pending, message, session, group, actor, deps)
+            if _from_this_bot(reply_to, deps.bot_username):
+                # a reply to any NON-pending bot message — an old result, the
+                # board, a dead proposal — is a fresh NL intent, exactly as if
+                # @mentioned: the mention tax lifts after the first interaction (§10.5)
+                return await _handle_nl_text(message, session, group, actor, deps)
+
         text = message.get("text", "")
         if _mentions_bot(text, deps.bot_username) and deps.llm is not None:
             return await _handle_nl_text(message, session, group, actor, deps)
 
     return []
+
+
+async def _park_ambiguous_slash(
+    ambiguous: AmbiguousRef,
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+    deps: Deps,
+) -> list[OutboundAction]:
+    """A slash mutation that hit an ambiguous reference parks as a proposal in
+    the pick stage (§0.7, §13) — same loop, same buttons, same commit."""
+    if ambiguous.intent is None or actor is None:
+        # a read (the settle sheet) can't host a pick-list, and an anonymous
+        # admin can't propose: guidance instead
+        return [SendMessage(chat_id=message["chat"]["id"], text=ambiguous_guidance(ambiguous.ref))]
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    converted = nl.ConvertedIntent(intent=ambiguous.intent, rounded_from=None)
+    return await _propose(converted, message, session, group, actor, deps, ledger)
+
+
+def _from_this_bot(reply_to: dict[str, Any], bot_username: str | None) -> bool:
+    """Whether a reply target is one of OUR messages — another bot's isn't ours,
+    and with no known username we claim nothing rather than guess."""
+    sender = reply_to.get("from") or {}
+    if not sender.get("is_bot") or bot_username is None:
+        return False
+    return str(sender.get("username", "")).lower() == bot_username.lower()
+
+
+async def _handle_reply_to_pending(
+    pending: PendingIntent,
+    message: dict[str, Any],
+    session: AsyncSession,
+    group: Group,
+    actor: User | None,
+    deps: Deps,
+) -> list[OutboundAction]:
+    """A reply to a live proposal is a correction (§10.2): refine the parked
+    intent and edit the proposal in place — the reply's author is the actor."""
+    assert deps.llm is not None and pending.message_id is not None
+    if actor is None:
+        return []  # anonymous admins can't correct, like they can't propose
+    if pending_store.is_expired(pending):
+        # expiry is computed on read (§10.4); no resend dead-end: the reply that
+        # discovers it buries the proposal AND is processed as a fresh intent
+        buried = EditMessage(
+            chat_id=pending.chat_id,
+            message_id=pending.message_id,
+            text="⌛ Expired — nothing was recorded.",
+        )
+        await session.delete(pending)
+        return [buried, *await _handle_nl_text(message, session, group, actor, deps)]
+    correction = _strip_bot_mention(message.get("text", ""), deps.bot_username)
+    ledger = await session.get_one(Ledger, pending.ledger_id)  # the PINNED ledger (§10)
+    # when the proposal is waiting on a pick, the reply may be the answer (§13):
+    # hand the model the open slot's candidates as ready-to-echo pinned refs
+    prior = _INTENT.validate_python(pending.intent_json)
+    try:
+        slot = await _first_ambiguity(
+            prior,
+            nl.ConvertedIntent(intent=prior, rounded_from=None),
+            session,
+            group,
+            actor,
+            ledger,
+            pending,
+        )
+    except (Rejection, ValueError):
+        # the parked intent no longer renders at all (its matches vanished):
+        # no choices to offer, but the correction itself may repair it
+        slot = None
+    candidates = None
+    if isinstance(slot, AmbiguousRef):
+        labels = await _pick_labels(session, slot.candidates)
+        candidates = [f"id:{user_id} = {label}" for user_id, label in labels]
+    elif isinstance(slot, AmbiguousExpense):
+        # capped like the buttons: the reply picks among what the message shows
+        candidates = [
+            f"expense_id:{e.id} = {e.description} — {fmt(e.amount_minor, e.currency)}"
+            for e in slot.candidates[:EXPENSE_PICK_CAP]
+        ]
+    try:
+        wire = await deps.llm.refine(pending.intent_json, correction, candidates)
+    except LLMUnavailable:
+        # a transport failure is NOT the user's sentence (issue #13 grill), and
+        # it is no reason to touch the proposal either
+        return [
+            SendMessage(
+                chat_id=pending.chat_id,
+                text=(
+                    "⚠️ I couldn't reach my language model just now — the proposal is "
+                    "unchanged; try that correction again in a moment."
+                ),
+            )
+        ]
+    if isinstance(wire, WireUndoRedo):
+        # detected, never honored (§9) — and not a correction: proposal untouched
+        return [SendMessage(chat_id=pending.chat_id, text=UNDO_POINTER)]
+    if isinstance(wire, WireSetup):
+        # targets come from the MESSAGE (§11), and this reply targets the BOT's
+        # proposal — without a text_mention there is nobody to register
+        targets, _, _ = _setup_entries(message)
+        if not targets:
+            return [SendMessage(chat_id=pending.chat_id, text=SETUP_GUIDANCE)]
+        converted = nl.ConvertedIntent(intent=Setup(targets=targets), rounded_from=None)
+    else:
+        converted = nl.to_intent(
+            wire, logging_currency=ledger.logging_currency, home_currency=group.home_currency
+        )
+    intent = converted.intent
+    if isinstance(intent, Unknown):
+        # not readable as a correction: the proposal stands exactly as it was
+        return [
+            SendMessage(
+                chat_id=pending.chat_id,
+                text=(
+                    "🤷 I couldn't read that as a correction — the proposal is unchanged. "
+                    "Reply again with the fix, or tap ✖ Cancel."
+                ),
+            )
+        ]
+    try:
+        reply = await _nl_read_reply(intent, session, group, actor)
+    except AmbiguousRef as ambiguous:
+        # a read can't host a pick-list stage: guidance, proposal untouched
+        return [SendMessage(chat_id=pending.chat_id, text=ambiguous_guidance(ambiguous.ref))]
+    except (Rejection, ValueError) as exc:
+        return [SendMessage(chat_id=pending.chat_id, text=str(exc))]
+    if reply is not None:
+        # a read mid-decision runs inline; it is not a correction, so the
+        # proposal (and its TTL) stays exactly as it was (issue #14 grill)
+        return [SendMessage(chat_id=pending.chat_id, text=reply.text, reply_markup=reply.markup)]
+    # a "me" the correction introduces is the REPLIER's (issue #14 grill); the
+    # original proposer's refs were pinned at park time and echo back as id:<n>
+    intent = nl.pin_me(intent, actor.id)
+    try:
+        # a descriptive expense reference pins NOW when unique, like the fresh
+        # door (§10.3 WYSIWYG): the previewed #id is the one that commits
+        intent = await _pin_unique_match(intent, session, ledger)
+    except (Rejection, ValueError) as exc:
+        return [SendMessage(chat_id=pending.chat_id, text=str(exc))]
+    try:
+        # savepoint: a rejected correction (unknown member, bad currency) must
+        # not kill a good proposal — everything rolls back and it stands.
+        # The seed stays the ORIGINAL proposal's: WYSIWYG shares survive
+        # refines (§7.1); an ambiguous new ref renders as the pick stage (§13).
+        async with session.begin_nested():
+            text, markup = await _proposal_stage(
+                intent, converted, session, group, actor, ledger, pending
+            )
+            pending.intent_json = intent.model_dump(mode="json")
+            pending_store.refresh(pending, ttl_minutes=deps.pending_ttl_minutes)
+    except (Rejection, ValueError) as exc:
+        return [SendMessage(chat_id=pending.chat_id, text=str(exc))]
+    return [
+        EditMessage(
+            chat_id=pending.chat_id,
+            message_id=pending.message_id,
+            text=text,
+            reply_markup=markup,
+        )
+    ]
 
 
 async def _handle_nl_text(
@@ -775,6 +1147,10 @@ async def _handle_nl_text(
     try:
         async with session.begin_nested():
             return await _run_nl_intent(wire, message, session, group, actor, deps)
+    except AmbiguousRef as ambiguous:
+        # only reads reach here — mutations render ambiguity as a pick-list
+        # stage (§13); a read can't host one, so guidance instead
+        return [SendMessage(chat_id=chat_id, text=ambiguous_guidance(ambiguous.ref))]
     except (Rejection, ValueError) as exc:
         return [SendMessage(chat_id=chat_id, text=str(exc))]
 
@@ -794,7 +1170,7 @@ async def _run_nl_intent(
     ledger = await session.get_one(Ledger, group.active_ledger_id)
     if isinstance(wire, WireDeleteExpense | WireEditExpense):
         converted = nl.ConvertedIntent(
-            intent=await _resolve_expense_wire(wire, message, session), rounded_from=None
+            intent=await _resolve_expense_wire(wire, message, session, ledger), rounded_from=None
         )
     elif isinstance(wire, WireSetup):
         # targets come from the MESSAGE, not the model (§11): only the reply
@@ -816,11 +1192,29 @@ async def _run_nl_intent(
     return await _propose(converted, message, session, group, actor, deps, ledger)
 
 
+async def _pin_unique_match(intent: Intent, session: AsyncSession, ledger: Ledger) -> Intent:
+    """Pin a refined delete/edit's descriptive match when it is unique (§10.3);
+    ambiguity stays unpinned for the pick stage, no match raises the guidance."""
+    if (
+        not isinstance(intent, DeleteExpense | EditExpense)
+        or intent.expense_id is not None
+        or intent.match is None
+    ):
+        return intent
+    try:
+        expense = await resolve_expense_match(session, ledger.id, intent.match)
+    except AmbiguousExpense:
+        return intent  # the proposal renders the expense pick stage (§13)
+    return intent.model_copy(update={"expense_id": expense.id})
+
+
 async def _resolve_expense_wire(
-    wire: Any, message: dict[str, Any], session: AsyncSession
+    wire: Any, message: dict[str, Any], session: AsyncSession, ledger: Ledger
 ) -> DeleteExpense | EditExpense:
     """Pin the expense a NL delete/edit means (§11): reply-to-target primary,
-    a bare #id in the text fallback. Descriptive matching arrives in slice 13."""
+    a bare #id fallback, descriptive match tertiary. A unique match pins NOW —
+    the proposal names one concrete expense, so a deletion in the meantime
+    fails the confirm instead of silently retargeting (§10.3 WYSIWYG)."""
     reply_to = message.get("reply_to_message")
     expense_id = await resolve_expense_id(
         session,
@@ -828,14 +1222,21 @@ async def _resolve_expense_wire(
         reply_message_id=reply_to["message_id"] if reply_to is not None else None,
         explicit_id=wire.expense_id,
     )
-    if expense_id is None:
+    if expense_id is None and wire.match is not None:
+        # ambiguity parks unpinned: the proposal renders the expense pick stage (§13)
+        with contextlib.suppress(AmbiguousExpense):
+            expense_id = (await resolve_expense_match(session, ledger.id, wire.match)).id
+    if expense_id is None and wire.match is None:
         raise Rejection(
-            "🤷 Which expense? Reply to its result message or give its #id — " 'e.g. "delete #42".'
+            '🤷 Which expense? Reply to its result message or give its #id — e.g. "delete #42".'
         )
     if isinstance(wire, WireDeleteExpense):
-        return DeleteExpense(expense_id=expense_id)
+        return DeleteExpense(expense_id=expense_id, match=wire.match)
     return EditExpense(
-        expense_id=expense_id, description=wire.description, occurred_on=wire.occurred_on
+        expense_id=expense_id,
+        match=wire.match,
+        description=wire.description,
+        occurred_on=wire.occurred_on,
     )
 
 
@@ -875,30 +1276,105 @@ async def _propose(
             "I can't tell who sent that — anonymous admins can't record changes. "
             "Turn off 'Remain anonymous' and try again."
         )
-    intent = converted.intent
-    seed = message["message_id"]
-    if isinstance(intent, AddExpense):
-        text = await _expense_proposal_text(intent, converted, session, group, actor, ledger, seed)
-    else:
-        summary = await _proposal_summary(intent, session, group, actor)
-        text = action_proposal_reply(ledger_name=ledger.name, summary=summary)
-
+    # first-person refs anchor to their introducer (issue #14 grill): pin the
+    # proposer's "me" before the intent is rendered or parked
+    intent = nl.pin_me(converted.intent, actor.id)
     parked = await pending_store.park(
         session,
         chat_id=message["chat"]["id"],
         ledger_id=ledger.id,
         proposer=actor,
-        seed=seed,
+        seed=message["message_id"],
         intent=intent,
         ttl_minutes=deps.pending_ttl_minutes,
     )
+    # rendered AFTER parking: an ambiguous ref renders as the pick-list stage,
+    # whose buttons carry the pending row's id (§13); a rejection rolls the
+    # park back with everything else
+    text, markup = await _proposal_stage(intent, converted, session, group, actor, ledger, parked)
     return [
         SendMessage(
             chat_id=message["chat"]["id"],
             text=text,
-            reply_markup=confirm_keyboard(parked.id),
+            reply_markup=markup,
             records_message_for_pending_id=parked.id,
         )
+    ]
+
+
+async def _proposal_stage(
+    intent: Intent,
+    converted: nl.ConvertedIntent,
+    session: AsyncSession,
+    group: Group,
+    actor: User,
+    ledger: Ledger,
+    pending: PendingIntent,
+) -> tuple[str, InlineKeyboard]:
+    """What the proposal message shows right now (§10): the full WYSIWYG preview
+    with Confirm/Cancel — or, while a reference is ambiguous, the pick-list
+    stage for the FIRST open slot (one slot at a time, §13)."""
+    try:
+        if isinstance(intent, AddExpense):
+            text = await _expense_proposal_text(
+                intent, converted, session, group, actor, ledger, pending.seed
+            )
+        else:
+            summary = await _proposal_summary(intent, session, group, actor, ledger)
+            text = action_proposal_reply(ledger_name=ledger.name, summary=summary)
+    except AmbiguousRef as ambiguous:
+        choices = await _pick_labels(session, ambiguous.candidates)
+        text = pick_stage_reply(
+            ledger_name=ledger.name, gist=_proposal_gist(intent), ref=ambiguous.ref
+        )
+        return text, pick_keyboard(pending.id, choices)
+    except AmbiguousExpense as ambiguous:
+        return _expense_pick_stage(intent, ambiguous, ledger, pending.id)
+    return text, confirm_keyboard(pending.id)
+
+
+def _expense_pick_stage(
+    intent: Intent, ambiguous: AmbiguousExpense, ledger: Ledger, pending_id: int
+) -> tuple[str, InlineKeyboard]:
+    """The expense pick stage's message + buttons (§11 tertiary, §13): capped
+    at the newest few, saying what was dropped."""
+    shown = ambiguous.candidates[:EXPENSE_PICK_CAP]  # newest first
+    text = expense_pick_stage_reply(
+        ledger_name=ledger.name,
+        gist=_proposal_gist(intent),
+        query=ambiguous.query,
+        shown=len(shown),
+        total=len(ambiguous.candidates),
+    )
+    return text, expense_pick_keyboard(pending_id, _expense_pick_labels(shown))
+
+
+def _proposal_gist(intent: Intent) -> str:
+    """The unresolved one-liner a pick stage shows — no refs, no shares: those
+    can't render until the slot is pinned."""
+    if isinstance(intent, AddExpense):
+        assert intent.currency is not None  # concrete after nl.to_intent (§3)
+        return f"{intent.description} — {fmt(intent.amount_minor, intent.currency)}"
+    if isinstance(intent, SettleUp) and intent.amount_minor is not None:
+        assert intent.currency is not None
+        return f"a payment of {fmt(intent.amount_minor, intent.currency)}"
+    return intent.kind.replace("_", " ")
+
+
+def _expense_pick_labels(candidates: list[Expense]) -> list[tuple[int, str]]:
+    """Expense pick buttons (§13): the #id plus enough of the row to choose by."""
+    return [
+        (e.id, f"#{e.id} {e.description} — {fmt(e.amount_minor, e.currency)}") for e in candidates
+    ]
+
+
+async def _pick_labels(session: AsyncSession, candidates: list[User]) -> list[tuple[int, str]]:
+    """Pick buttons labelled apart (§13): two Sams differ by @handle; two
+    stale-colliding @handles differ by display name."""
+    usernames = await usernames_of(session, [u.id for u in candidates])
+    return [
+        (u.id, f"{u.display_name} (@{usernames[u.id]})" if usernames.get(u.id) else u.display_name)
+        for u in candidates
     ]
 
 
@@ -929,7 +1405,7 @@ async def _expense_proposal_text(
 
 
 async def _proposal_summary(
-    intent: Intent, session: AsyncSession, group: Group, actor: User
+    intent: Intent, session: AsyncSession, group: Group, actor: User, ledger: Ledger
 ) -> str:
     """One line saying what Confirm will do — refs previewed read-only (§6)."""
     if isinstance(intent, SettleUp):
@@ -941,13 +1417,15 @@ async def _proposal_summary(
             f"{fmt(intent.amount_minor, intent.currency)}."
         )
     if isinstance(intent, DeleteExpense):
-        return f"Delete expense #{intent.expense_id}."
+        expense = await _previewed_expense(intent, session, group, ledger)
+        return f"Delete expense #{expense.id} ({expense.description})."
     if isinstance(intent, EditExpense):
+        expense = await _previewed_expense(intent, session, group, ledger)
         changes = [
             f'description → "{intent.description}"' if intent.description is not None else "",
             f"date → {intent.occurred_on}" if intent.occurred_on is not None else "",
         ]
-        return f"Edit #{intent.expense_id}: {', '.join(c for c in changes if c)}."
+        return f"Edit #{expense.id}: {', '.join(c for c in changes if c)}."
     if isinstance(intent, SwitchLedger):
         target = await find_ledger(session, group.id, intent.name_or_id)
         return f"Switch to 📒 {target.name} — new expenses land there."
@@ -972,6 +1450,22 @@ async def _proposal_summary(
         names = join_names([t.display_name for t in intent.targets])
         return f"Register {names} as members — this is permanent (no Undo)."
     raise AssertionError(f"unproposable intent kind: {intent.kind}")
+
+
+async def _previewed_expense(
+    intent: DeleteExpense | EditExpense, session: AsyncSession, group: Group, ledger: Ledger
+) -> Expense:
+    """The expense a delete/edit preview names (§11): pinned id when there is
+    one — behind the same ledger seal the commit enforces (§0.10), so the
+    preview never names (or leaks) what Confirm would refuse — else the
+    descriptive match: unique, ambiguous (pick stage), or nothing."""
+    if intent.expense_id is not None:
+        return await sealed_expense(session, group.id, ledger.id, intent.expense_id)
+    if intent.match is None:
+        raise Rejection(
+            '🤷 Which expense? Reply to its result message or give its #id — e.g. "delete #42".'
+        )
+    return await resolve_expense_match(session, ledger.id, intent.match)
 
 
 def _strip_bot_mention(text: str, bot_username: str | None) -> str:

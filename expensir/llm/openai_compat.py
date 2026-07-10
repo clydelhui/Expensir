@@ -6,12 +6,13 @@ chat-completions dialect: only LLM_BASE_URL / LLM_API_KEY / LLM_MODEL differ.
 
 import json
 import re
+from typing import Any
 
 import httpx
 from pydantic import TypeAdapter, ValidationError
 
 from expensir.llm.base import LLMUnavailable
-from expensir.llm.prompts import extraction_messages, retry_messages
+from expensir.llm.prompts import extraction_messages, refine_messages, retry_messages
 from expensir.llm.wire import WireResult, WireUnknown
 
 _WIRE: TypeAdapter[WireResult] = TypeAdapter(WireResult)
@@ -33,9 +34,19 @@ class OpenAICompatLLM:
         self._http = http if http is not None else httpx.AsyncClient(timeout=timeout)
 
     async def extract_text(self, text: str) -> WireResult:
+        return await self._complete_wire(extraction_messages(text))
+
+    async def refine(
+        self,
+        prior_intent: dict[str, Any],
+        correction: str,
+        candidates: list[str] | None = None,
+    ) -> WireResult:
+        return await self._complete_wire(refine_messages(prior_intent, correction, candidates))
+
+    async def _complete_wire(self, messages: list[dict[str, str]]) -> WireResult:
         """One parse attempt + one retry showing the validation error (issue #13
         grill); still invalid -> wire unknown. Transport trouble -> LLMUnavailable."""
-        messages = extraction_messages(text)
         content = await self._chat(messages)
         try:
             return _parse(content)

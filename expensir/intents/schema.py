@@ -43,14 +43,18 @@ class DeleteExpense(BaseModel):
     """Soft-delete: flips deleted_at, undoable — 'fixing history' (§4, §8)."""
 
     kind: Literal["delete_expense"] = "delete_expense"
-    expense_id: int  # resolved via reply-to-target / #id (§11)
+    # resolved via reply-to-target / #id (§11); None while a descriptive match
+    # is still ambiguous — the pick stage pins it before Confirm appears (§13)
+    expense_id: int | None = None
+    match: str | None = None  # the descriptive query, §11 tertiary tier
 
 
 class EditExpense(BaseModel):
     """Non-financial fields ONLY (§4): display never reorders balances (§0.4)."""
 
     kind: Literal["edit_expense"] = "edit_expense"
-    expense_id: int
+    expense_id: int | None = None  # same resolution tiers as DeleteExpense (§11)
+    match: str | None = None
     description: str | None = None
     occurred_on: str | None = None  # ISO date; DISPLAY ONLY (§7.2)
 

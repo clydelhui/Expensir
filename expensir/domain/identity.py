@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from expensir.db.models import Action, Expense, Group, GroupMember, Identity, Ledger, User, utcnow
-from expensir.domain.errors import Rejection
+from expensir.domain.errors import AmbiguousExpense, AmbiguousRef, Rejection
 
 
 async def ensure_group(session: AsyncSession, platform_chat_id: int, title: str | None) -> Group:
@@ -56,6 +56,15 @@ async def resolve_refs(
         if ref == "me" and actor is not None:
             resolved[ref] = actor
             continue
+        if ref.startswith("id:"):
+            # a pinned reference (issue #14): resolved by id, valid even after
+            # the member departs — pinning survives departure (§10)
+            member = await _member_by_id(session, group_id, ref.removeprefix("id:"))
+            if member is None:
+                unknown.append(ref)
+            else:
+                resolved[ref] = member
+            continue
         member = await _member_by_ref(session, group_id, ref)
         if member is None:
             unknown.append(ref)
@@ -83,13 +92,40 @@ async def _member_by_ref(session: AsyncSession, group_id: int, ref: str) -> User
         for member in await _members_by_display_name(session, group_id, ref):
             matches[member.id] = member
     if len(matches) > 1:
-        # stale stored usernames can collide, and given names repeat; stopgap
-        # guidance until the pick-list slice (§10, §13)
-        raise Rejection(
-            f"🤔 More than one member here matches {ref} — use their @username "
-            "so I know who you mean."
-        )
+        # stale stored usernames can collide, and given names repeat: never
+        # guess — proposals render the candidates as a pick-list (§10, §13)
+        raise AmbiguousRef(ref, sorted(matches.values(), key=lambda u: u.id))
     return next(iter(matches.values()), None)
+
+
+def ambiguous_guidance(ref: str) -> str:
+    """The fallback for paths that cannot render a pick-list (reads, slash for
+    now): same wording the pre-pick-list rejection used."""
+    return (
+        f"🤔 More than one member here matches {ref} — use their @username so I know who you mean."
+    )
+
+
+async def usernames_of(session: AsyncSession, user_ids: list[int]) -> dict[int, str | None]:
+    rows = await session.execute(
+        select(Identity.user_id, Identity.username).where(
+            Identity.platform == "telegram", Identity.user_id.in_(user_ids)
+        )
+    )
+    return {user_id: username for user_id, username in rows.all()}
+
+
+async def _member_by_id(session: AsyncSession, group_id: int, raw_id: str) -> User | None:
+    """One member (current OR departed) of this group by pinned user id."""
+    if not raw_id.isdigit():
+        return None  # a malformed pin is an unknown ref, never a crash
+    return (
+        await session.execute(
+            select(User)
+            .join(GroupMember, GroupMember.user_id == User.id)
+            .where(GroupMember.group_id == group_id, User.id == int(raw_id))
+        )
+    ).scalar_one_or_none()
 
 
 async def _members_by_username(session: AsyncSession, group_id: int, username: str) -> list[User]:
@@ -174,6 +210,34 @@ async def _expense_id_of_result_message(
         assert isinstance(expense_id, int)
         return expense_id
     return None
+
+
+async def match_expenses(session: AsyncSession, ledger_id: int, query: str) -> list[Expense]:
+    """§11 tertiary tier: deterministic CPU matching, never the LLM (issue #14
+    grill). Every query token must appear in the description, case-insensitive;
+    candidates come back newest first."""
+    expenses = (
+        await session.execute(
+            select(Expense)
+            .where(Expense.ledger_id == ledger_id, Expense.deleted_at.is_(None))
+            .order_by(Expense.id.desc())
+        )
+    ).scalars()
+    tokens = query.lower().split()
+    return [e for e in expenses if all(token in e.description.lower() for token in tokens)]
+
+
+async def resolve_expense_match(session: AsyncSession, ledger_id: int, query: str) -> Expense:
+    """One expense for a descriptive reference (§11): unique or nothing."""
+    candidates = await match_expenses(session, ledger_id, query)
+    if not candidates:
+        raise Rejection(
+            f"🤷 Nothing here matches “{query}” — reply to the expense's result "
+            "message or give its #id."
+        )
+    if len(candidates) > 1:
+        raise AmbiguousExpense(query, candidates)
+    return candidates[0]
 
 
 async def display_names(session: AsyncSession, user_ids: list[int]) -> dict[int, str]:

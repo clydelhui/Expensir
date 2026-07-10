@@ -109,6 +109,37 @@ def action_proposal_reply(*, ledger_name: str, summary: str) -> str:
     return f"📒 {ledger_name} • 💡 {summary}\n\n↳ reply to correct"
 
 
+def pick_stage_reply(*, ledger_name: str, gist: str, ref: str) -> str:
+    """A proposal waiting on one ambiguous slot (§10, §13): the pick-list stage.
+
+    No shares preview here — they can't be computed until the slot is pinned;
+    the same pin prefix and correction footer as every proposal."""
+    return (
+        f"📒 {ledger_name} • 💡 {gist}\n"
+        f"🤔 More than one member here matches “{ref}” — tap who you meant.\n"
+        f"\n"
+        f"↳ reply to correct"
+    )
+
+
+def expense_pick_stage_reply(
+    *, ledger_name: str, gist: str, query: str, shown: int, total: int
+) -> str:
+    """The expense flavour of the pick stage (§11 tertiary, §13); when the
+    candidate list is capped, say what was dropped rather than hide it."""
+    capped = (
+        f" (showing the {shown} newest of {total} — use its #id for an older one)"
+        if total > shown
+        else ""
+    )
+    return (
+        f"📒 {ledger_name} • 💡 {gist}\n"
+        f"🤔 More than one expense matches “{query}” — tap the one you meant{capped}.\n"
+        f"\n"
+        f"↳ reply to correct"
+    )
+
+
 def settle_reply(
     *,
     ledger_name: str,
