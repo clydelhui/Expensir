@@ -36,6 +36,20 @@ def test_migrations_apply_cleanly_on_sqlite(tmp_path):
     assert tables >= SLICE_1_TABLES | SLICE_2_TABLES | SLICE_9_TABLES
 
 
+def test_expense_gains_the_ledger_deleted_created_index_to_match_settlements(tmp_path):
+    """Slice 14 (#24, ADR-0012): the merged listing walks expenses the same way
+    settlements are already indexed."""
+    db_path = tmp_path / "migrated.db"
+
+    command.upgrade(upgrade_config(f"sqlite+aiosqlite:///{db_path}"), "head")
+
+    with sqlite3.connect(db_path) as conn:
+        indexes = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+    assert "ix_expenses_ledger_deleted_created" in indexes
+
+
 def test_exported_database_url_never_hijacks_a_programmatic_url(tmp_path, monkeypatch):
     """A test/tooling run must migrate the URL it was given, not the deploy DB from the env."""
     deploy_db = tmp_path / "pretend-prod.db"

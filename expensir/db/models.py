@@ -99,6 +99,8 @@ class Expense(Base):
     __tablename__ = "expenses"
     __table_args__ = (
         Index("ix_expenses_ledger_deleted", "ledger_id", "deleted_at"),
+        # the merged transaction listing's walk (ADR-0012), matching Settlement's
+        Index("ix_expenses_ledger_deleted_created", "ledger_id", "deleted_at", "created_at"),
         Index("ix_expenses_created_by_action", "created_by_action_id"),
     )
 

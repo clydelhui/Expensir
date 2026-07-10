@@ -91,7 +91,7 @@ async def test_one_pick_pins_every_occurrence_of_the_same_string(deps):
         pending = (await session.execute(select(PendingIntent))).scalar_one()
         sam_b = await user_id_of(session, OTHER_SAM)
 
-    (ack, edit) = await dispatch(
+    ack, edit = await dispatch(
         callback_update(
             data=f"v1:pick:{pending.id}:{sam_b}", from_user=ALICE, message_id=pending.message_id
         ),
@@ -129,7 +129,7 @@ async def test_two_ambiguous_refs_resolve_one_slot_at_a_time(deps):
         sam_a = await user_id_of(session, SAM)
 
     # stage 1: Sam's slot is open, Kim's isn't offered yet
-    (_, edit) = await dispatch(
+    _, edit = await dispatch(
         callback_update(
             data=f"v1:pick:{pending.id}:{sam_a}", from_user=ALICE, message_id=pending.message_id
         ),
@@ -141,7 +141,7 @@ async def test_two_ambiguous_refs_resolve_one_slot_at_a_time(deps):
 
     async with deps.session_factory() as session:
         kim_one = await user_id_of(session, user(1005, "Kim", "kim_one"))
-    (_, edit) = await dispatch(
+    _, edit = await dispatch(
         callback_update(
             data=f"v1:pick:{pending.id}:{kim_one}", from_user=ALICE, message_id=pending.message_id
         ),

@@ -53,6 +53,7 @@ from expensir.domain.identity import (
 from expensir.domain.ledgers import find_ledger, ledgers_of
 from expensir.domain.money import fmt, to_minor
 from expensir.domain.settle import record_settlement, suggested_amount
+from expensir.domain.transactions import PAGE_SIZE, list_transactions
 from expensir.domain.undo import ToggleDirection, toggle
 from expensir.format.keyboards import (
     InlineKeyboard,
@@ -60,6 +61,7 @@ from expensir.format.keyboards import (
     expense_pick_keyboard,
     pick_keyboard,
     redo_keyboard,
+    transactions_pager_keyboard,
     undo_keyboard,
 )
 from expensir.format.render import (
@@ -78,6 +80,7 @@ from expensir.format.render import (
     proposal_reply,
     settle_reply,
 )
+from expensir.format.transactions import transactions_reply
 from expensir.intents import nl
 from expensir.intents.commands import (
     DELETE_USAGE,
@@ -97,6 +100,7 @@ from expensir.intents.commands import (
     parse_settle,
     parse_shares,
     parse_switch,
+    parse_transactions,
     parse_unarchive,
 )
 from expensir.intents.schema import (
@@ -291,6 +295,7 @@ async def _handle_confirm_tap(
     consumes the row — a double-tap finds nothing."""
     ack = AnswerCallbackQuery(callback_query_id=callback["id"])
     verb, pending_id = match.group(1), int(match.group(2))
+    markup: InlineKeyboard | None
 
     message = callback.get("message") or {}
     chat = message.get("chat")
@@ -448,7 +453,9 @@ async def _handle_pick_tap(
     """A pick-list choice (§13): pin the open slot to the tapped member and
     re-render the proposal — the next open slot, or Confirm once all pinned."""
 
-    def pin(intent: Intent, slot: AmbiguousRef | AmbiguousExpense | None, chosen: int):
+    def pin(
+        intent: Intent, slot: AmbiguousRef | AmbiguousExpense | None, chosen: int
+    ) -> Intent | None:
         if not isinstance(slot, AmbiguousRef) or chosen not in {u.id for u in slot.candidates}:
             return None
         return nl.pin_ref(intent, slot.ref, chosen)
@@ -462,7 +469,9 @@ async def _handle_pickx_tap(
     """The expense flavour of a pick (§11 tertiary, §13): pin the descriptive
     slot to the tapped expense and re-render — same loop, same Confirm gate."""
 
-    def pin(intent: Intent, slot: AmbiguousRef | AmbiguousExpense | None, chosen: int):
+    def pin(
+        intent: Intent, slot: AmbiguousRef | AmbiguousExpense | None, chosen: int
+    ) -> Intent | None:
         if not isinstance(slot, AmbiguousExpense) or chosen not in {e.id for e in slot.candidates}:
             return None
         return nl.pin_expense(intent, chosen)
@@ -1590,6 +1599,19 @@ async def _run_members(
     return Reply(text=members_reply(lines))
 
 
+async def _run_transactions(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+) -> Reply:
+    # a content read (ADR-0012): no lock, no action row, active ledger only (§0.7, §0.10)
+    parse_transactions(message["text"])  # no-arg guard; a trailing token is a usage error
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    page = await list_transactions(session, ledger.id, limit=PAGE_SIZE)
+    return Reply(
+        text=transactions_reply(ledger_name=ledger.name, page=page),
+        markup=transactions_pager_keyboard(ledger.id, page),
+    )
+
+
 def _expense_runner(parse: Callable[[str], ParsedExpense]) -> CommandRunner:
     async def run(
         message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
@@ -1884,6 +1906,7 @@ _RUNNERS: dict[str, CommandRunner] = {
     "shares": _expense_runner(parse_shares),
     "percent": _expense_runner(parse_percent),
     "balance": _run_balance,
+    "transactions": _run_transactions,
     "settle": _run_settle,
     "delete": _run_delete,
     "edit": _run_edit,

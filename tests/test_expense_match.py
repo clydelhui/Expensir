@@ -167,7 +167,7 @@ async def test_a_reply_can_resolve_the_open_expense_slot(deps):
     assert f"#{drinks_id}" in edit.text  # the choice, previewed
     labels = [b[0] for b in keyboard_buttons(edit.reply_markup)]
     assert labels == ["✅ Confirm", "✖ Cancel"]  # the slot pinned -> Confirm appears
-    (_, correction, candidates) = fake.refined[0]
+    _, correction, candidates = fake.refined[0]
     assert correction == "the drinks one"
     assert candidates == [
         f"expense_id:{drinks_id} = dinner drinks — SGD 30.00",
@@ -278,7 +278,7 @@ async def test_a_reply_after_every_match_vanished_still_reaches_the_llm(deps):
     (edit,) = actions
     assert edit.kind == "edit_message"
     assert f"#{taxi_id}" in edit.text  # the correction re-aimed the delete
-    (_, correction, candidates) = fake.refined[0]
+    _, correction, candidates = fake.refined[0]
     assert correction == "the taxi one instead"
     assert candidates is None  # the dead slot offers no choices; the reply stands alone
 

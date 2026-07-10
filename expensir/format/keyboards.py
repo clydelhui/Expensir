@@ -4,6 +4,12 @@ board [Settle] button, which carries its whole tuple + amount inline (ADR-0006).
 from typing import Any
 
 from expensir.domain.money import fmt
+from expensir.domain.transactions import (
+    TransactionCursor,
+    TransactionPage,
+    TransactionRow,
+    encode_cursor,
+)
 from expensir.format.board import BoardLine
 
 InlineKeyboard = dict[str, Any]
@@ -51,6 +57,34 @@ def sheet_keyboard(ledger_id: int, transfers: list[BoardLine]) -> InlineKeyboard
             for t in transfers
         ]
     }
+
+
+def transactions_pager_keyboard(ledger_id: int, page: TransactionPage) -> InlineKeyboard | None:
+    """The /transactions pager (ADR-0012): keyset cursors anchored on the page's
+    edge rows, the ledger pinned at render time like the settle sheet's."""
+    if not page.rows:
+        # a cursor page can resolve to zero rows while has_newer/has_older stay
+        # True (concurrent delete of the last row on this side): nothing to anchor
+        return None
+    buttons: list[dict[str, str]] = []
+    if page.has_newer:
+        buttons.append(
+            {"text": "◀ Newer", "callback_data": _tx_cursor(ledger_id, "p", page.rows[0])}
+        )
+    if page.has_older:
+        buttons.append(
+            {"text": "▶ Older", "callback_data": _tx_cursor(ledger_id, "n", page.rows[-1])}
+        )
+    if not buttons:
+        return None
+    return {"inline_keyboard": [buttons]}
+
+
+def _tx_cursor(ledger_id: int, verb: str, anchor: TransactionRow) -> str:
+    """v1:tx:<ledger_id>:<n|p>:<epoch_us>:<kind>:<row_id> — ~40 bytes, within
+    Telegram's 64-byte callback_data budget (ADR-0012)."""
+    cursor = TransactionCursor(created_at=anchor.created_at, kind=anchor.kind, id=anchor.id)
+    return f"v1:tx:{ledger_id}:{verb}:{encode_cursor(cursor)}"
 
 
 def confirm_keyboard(pending_id: int) -> InlineKeyboard:

@@ -6,6 +6,7 @@ issue #13 grill). Few-shots below mirror tests/fixtures/llm/extractions.json.
 """
 
 import json
+from typing import Any
 
 SYSTEM_PROMPT = """\
 You parse ONE Telegram group-chat message addressed to an expense-splitting bot \
@@ -120,7 +121,7 @@ def extraction_messages(text: str) -> list[dict[str, str]]:
 
 
 def refine_messages(
-    prior_intent: dict, correction: str, candidates: list[str] | None = None
+    prior_intent: dict[str, Any], correction: str, candidates: list[str] | None = None
 ) -> list[dict[str, str]]:
     """The reply-to-correct loop's prompt (§10.2): prior intent + correction ->
     the full refined intent; candidates are the open pick-list slot's choices."""

@@ -16,6 +16,9 @@ PERCENT_USAGE = "Usage: /percent <amount> [ISO] <description> @name=<percent> ..
 HOMECURRENCY_USAGE = "Usage: /homecurrency <ISO>, e.g. /homecurrency USD"
 BALANCE_USAGE = "Usage: /balance — everyone's position, or /balance me for yours"
 MEMBERS_USAGE = "Usage: /members — lists everyone registered in this group. It takes no arguments."
+TRANSACTIONS_USAGE = (
+    "Usage: /transactions — the ledger's history, newest first. It takes no arguments."
+)
 DELETE_USAGE = "Usage: reply to the expense with /delete, or /delete <id> (the #id on its line)"
 EDIT_USAGE = (
     "Usage: reply to the expense with /edit, or /edit <id> — then [YYYY-MM-DD] "
@@ -181,6 +184,12 @@ def parse_members(text: str) -> None:
     """/members takes no arguments (#22): any trailing token is a usage error."""
     if text.split()[1:]:
         raise ValueError(MEMBERS_USAGE)
+
+
+def parse_transactions(text: str) -> None:
+    """/transactions is parameterless (ADR-0012): any trailing token is a usage error."""
+    if text.split()[1:]:
+        raise ValueError(TRANSACTIONS_USAGE)
 
 
 def parse_delete(text: str) -> int | None:
