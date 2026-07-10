@@ -198,6 +198,52 @@ WELCOME = (
     "receipt photos and natural language included."
 )
 
+HELP = (
+    "📖 Expensir commands\n"
+    "\n"
+    "💸 Add an expense\n"
+    "• Split equally: /equal 45 EUR dinner @alice @bob\n"
+    "  (leave names off to split among everyone in the group)\n"
+    "• Exact amounts: /exact 60 EUR taxi @alice=40 @bob=20\n"
+    "• By shares: /shares 90 EUR villa @alice=2 @bob\n"
+    "  (a bare name counts as 1 share)\n"
+    "• By percent: /percent 100 EUR gift @alice=70 @bob=30\n"
+    "The currency code is optional — without it I use the ledger's currency,\n"
+    "or the group's home currency if the ledger has none set.\n"
+    "\n"
+    "⚖️ Balances & settling\n"
+    "• /balance — who owes whom (/balance me for just yours)\n"
+    "• /settle @alice 30 EUR — record that you paid Alice 30 EUR\n"
+    "  (/settle @bob @alice 30 EUR if Bob paid her).\n"
+    "  Bare /settle @alice shows what's still open between you two.\n"
+    "\n"
+    "📜 History & fixing mistakes\n"
+    "• /transactions — the ledger's history, newest first\n"
+    "• Reply to an expense with /delete to remove it, or /delete 12\n"
+    "  (the #id on its line)\n"
+    "• Reply to an expense with /edit 2026-07-01 team lunch —\n"
+    "  a new date and/or description, all in one message\n"
+    "  (or pick it by id: /edit 12 2026-07-01 team lunch).\n"
+    "  Amounts and participants can't be edited; delete and re-add.\n"
+    "\n"
+    "👥 People\n"
+    "• /members — everyone registered in this group\n"
+    "• /setup — register someone who hasn't spoken yet: reply to one\n"
+    "  of their messages with /setup (a bare @username isn't enough)\n"
+    "\n"
+    "📒 Ledgers & currency\n"
+    "• /ledgers — list your ledgers\n"
+    "• /newledger Tokyo JPY — create one (currency optional) and switch to it\n"
+    "• /switch Tokyo — make another ledger active\n"
+    "• /archive Tokyo and /unarchive Tokyo — close and reopen one\n"
+    "• /homecurrency USD — the group's home currency; other currencies\n"
+    "  also show a ≈ equivalent in it\n"
+    "• /currency JPY — this ledger's own logging currency\n"
+    "\n"
+    "💬 You can also just @mention me or reply to my messages in plain\n"
+    'language — "alice paid 20 for coffee" — receipt photos included.'
+)
+
 
 class FileSource(Protocol):
     """Fetches a Telegram file's bytes by file_id (getFile + download, §13).
@@ -1010,6 +1056,8 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
             active = await session.get_one(Ledger, group.active_ledger_id)
             text = f"📒 {active.name} • Expensir is ready — try /equal, or /balance."
             return [SendMessage(chat_id=message["chat"]["id"], text=text)]
+        if command == "help":
+            return [SendMessage(chat_id=message["chat"]["id"], text=HELP)]
         runner = _RUNNERS.get(command or "")
         if runner is not None:
             try:
@@ -1306,7 +1354,7 @@ def _claim_caption_command(message: dict[str, Any], deps: Deps) -> dict[str, Any
     if "text" in message or not caption.startswith("/"):
         return message
     command = _command_of(caption, deps.bot_username)
-    if command != "start" and command not in _RUNNERS:
+    if command not in _INLINE_COMMANDS and command not in _RUNNERS:
         return message
     return {**message, "text": caption, "entities": message.get("caption_entities", [])}
 
@@ -2137,6 +2185,11 @@ def _setup_target(tg_user: dict[str, Any]) -> SetupTarget:
         username=tg_user.get("username"),
     )
 
+
+# commands answered inline in _handle_group_message, outside _RUNNERS — they
+# need no session/group/actor plumbing. Anything that enumerates every command
+# we claim (the caption door, a future setMyCommands menu) must include these.
+_INLINE_COMMANDS = frozenset({"start", "help"})
 
 _RUNNERS: dict[str, CommandRunner] = {
     "setup": _run_setup,
