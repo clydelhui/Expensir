@@ -51,6 +51,10 @@ _Avoid_: valid currency, supported currency (reserved for FX rate availability)
 
 ### Transactions & balances
 
+**Transaction**:
+The umbrella over an expense or a settlement — one dated, single-currency entry in a ledger's books. Not a stored thing of its own: a ledger's transactions are its expenses and settlements, merged and ordered by time. When the database sense is meant, always say "DB transaction" or "write transaction" — never bare "transaction".
+_Avoid_: entry, record, item
+
 **Expense**:
 A payment one member made on behalf of a set of participants, split among them. Belongs to one ledger and one currency.
 
@@ -69,6 +73,14 @@ _Avoid_: kitty, group balance
 **Suggested transfer**:
 A single debtor→creditor payment in the minimum-cash-flow simplification of the pool, shown on the board. Solver-dependent: one of possibly several minimal solutions. Tapping `[Settle]` records that suggested transfer as a settlement.
 _Avoid_: simplified debt, owed amount
+
+**Board**:
+The pinned message showing a ledger's current simplified balances — the suggested transfers that would zero out the pool, each with its own `[Settle]` button. A stateless projection re-rendered after every write; balances only, never a history — recent activity lives on the feed. One per ledger, pinned forever.
+_Avoid_: dashboard, balance message, feed
+
+**Feed**:
+The second pinned message per ledger: its most recent standing transactions, newest first, each with its own Undo. Like the board, a projection of the current books re-rendered after every write — an undone transaction simply drops out and an older one slides up. The glanceable "what just happened"; full history is a read away.
+_Avoid_: activity feed, log, timeline, board
 
 **Settle sheet**:
 The bot's reply to "settle up with X": the suggested transfers between two members, both directions, one line per currency, each with its own `[Settle]` button. A pure read, like the board — nothing commits until a line is tapped, and each tap records exactly that one line as one settlement.
@@ -103,7 +115,7 @@ _Avoid_: picker (reserved for the guided /add flow), menu
 
 **Action**:
 One audited, reversible unit of change. Every mutation appends exactly one action row, and every data row it writes carries that action's id, so undo is "soft-delete everything this action created." Reads and lifecycle events (join, leave, reactivation, identity refresh) write no action; registration via `/setup` appends one — permanent, with no undo.
-_Avoid_: event, transaction (reserved for the DB transaction), operation
+_Avoid_: event, transaction (an Action *records* a change; a Transaction *is* an expense or settlement — and the SQL sense is always spelled "DB transaction"), operation
 
 **Confidence**:
 An LLM self-report on a parsed intent. Cosmetic only — it never changes a branch. NL/OCR intents always propose + confirm regardless; confidence may at most decorate a proposal with an "I'm not fully sure I read this right" cue.

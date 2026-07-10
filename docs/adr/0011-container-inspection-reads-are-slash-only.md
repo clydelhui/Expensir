@@ -37,4 +37,5 @@ to colliding with content intents during parse.
   being NL-reachable is a user who types "who's in here?" and gets an `unknown` nudge toward
   `/members` — an acceptable trade for a structural utility.
 - A future read that is genuinely *content* (e.g. an expense history) would be NL-reachable and go
-  through the intent contract; the split is the deciding test, not "is it a read?".
+  through the intent contract; the split is the deciding test, not "is it a read?". (Realized:
+  ADR-0012's transaction history shipped NL-reachable from day one, as this test predicted.)
