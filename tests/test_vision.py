@@ -10,7 +10,13 @@ from sqlalchemy import func, select
 
 from expensir.core.handler import dispatch
 from expensir.db.models import Expense, PendingIntent
-from expensir.llm.wire import WireAddExpense, WireSettleUp, WireShowBalance, WireUnknown
+from expensir.llm.wire import (
+    WireAddExpense,
+    WireSettleUp,
+    WireShowBalance,
+    WireShowTransactions,
+    WireUnknown,
+)
 from tests.factories import callback_update, message_update, photo_update
 from tests.fakes import FakeFiles, FakeLLM, UnavailableLLM
 from tests.test_nl import ALICE, SAM, arrange_group, keyboard_buttons, user_id_of
@@ -386,6 +392,27 @@ async def test_vision_never_routes_a_kind_the_photo_door_forbids(deps):
         assert (
             await session.execute(select(func.count()).select_from(PendingIntent))
         ).scalar() == 0
+
+
+async def test_a_photo_correction_never_widens_to_a_read_kind(deps):
+    """Review fix (issue #26): the refine door enforces the same photo-kind
+    restriction as the fresh door — a receipt reply must never be answered
+    with a listing while the photo is silently dropped."""
+    await arrange_group(deps)
+    deps.llm = FakeLLM([DINNER], refinements=[WireShowTransactions()])
+    deps.files = FakeFiles(b"receipt-jpeg")
+    pending_id = await park_text_proposal(deps, DINNER)
+
+    (send,) = await dispatch(
+        photo_update(update_id=4, from_user=ALICE, message_id=11, reply_to_message_id=900),
+        deps,
+    )
+
+    assert send.kind == "send_message"
+    assert "couldn't read that as a correction" in send.text  # guidance, not a listing
+    async with deps.session_factory() as session:
+        pending = (await session.execute(select(PendingIntent))).scalar_one()
+        assert pending.id == pending_id  # the proposal stands exactly as it was
 
 
 async def test_a_photo_reply_still_buries_an_expired_proposal_when_vision_is_off(deps):

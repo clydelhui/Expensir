@@ -33,6 +33,12 @@ The object is discriminated by "kind" — pick exactly one:
   No amount stated = they want the settle sheet: amount null.
 - show_balance — asking who owes what.
   {"kind":"show_balance","scope":"me"|"group","convert_to":ISO-or-null}
+- show_transactions — asking what was spent or for the history of expenses/payments.
+  {"kind":"show_transactions"}
+  OWE-shaped questions are show_balance; SPENT-shaped questions (including totals, \
+"how much did we spend?") are show_transactions. It takes NO other fields: qualifiers \
+like a count, a category, or a person's name still map to plain show_transactions — \
+never invent fields for them.
 - delete_expense — remove a logged expense.
   {"kind":"delete_expense","expense_id":NUMBER-from-#id-or-null,"match":TEXT-or-null}
   "match": when no #id is given but the expense is named by description ("the dinner \
@@ -74,6 +80,11 @@ Examples:
 "what do I owe?" -> {"kind":"show_balance","scope":"me","convert_to":null}
 "show balances" -> {"kind":"show_balance","scope":"group","convert_to":null}
 "convert everything to USD" -> {"kind":"show_balance","scope":"group","convert_to":"USD"}
+"what did we spend?" -> {"kind":"show_transactions"}
+"how much did we spend?" -> {"kind":"show_transactions"}
+"show the last 3 expenses" -> {"kind":"show_transactions"}
+"what did we spend on food?" -> {"kind":"show_transactions"}
+"show Bob's expenses" -> {"kind":"show_transactions"}
 "delete #42" -> {"kind":"delete_expense","expense_id":42,"match":null}
 "delete this" (replying to an expense) -> {"kind":"delete_expense","expense_id":null,"match":null}
 "delete the dinner one" -> {"kind":"delete_expense","expense_id":null,"match":"dinner"}

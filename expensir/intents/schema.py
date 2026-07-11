@@ -114,6 +114,13 @@ class ShowBalance(BaseModel):
     convert_to: str | None = None  # /convert <TARGET>; arrives with the FX slice
 
 
+class ShowTransactions(BaseModel):
+    """A read: the history listing, page 1 + pager (ADR-0012). Parameterless —
+    qualified asks collapse to the plain listing; filters are future work."""
+
+    kind: Literal["show_transactions"] = "show_transactions"
+
+
 class Unknown(BaseModel):
     """The LLM couldn't map it (§4): a no-op — ask to rephrase, write nothing."""
 
@@ -135,6 +142,7 @@ Intent = Annotated[
     | UnarchiveLedger
     | Setup
     | ShowBalance
+    | ShowTransactions
     | Unknown,
     Field(discriminator="kind"),
 ]

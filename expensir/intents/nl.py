@@ -20,6 +20,7 @@ from expensir.intents.schema import (
     SetLoggingCurrency,
     SettleUp,
     ShowBalance,
+    ShowTransactions,
     SplitMember,
     SwitchLedger,
     UnarchiveLedger,
@@ -36,6 +37,7 @@ from expensir.llm.wire import (
     WireSetLoggingCurrency,
     WireSettleUp,
     WireShowBalance,
+    WireShowTransactions,
     WireSwitchLedger,
     WireUnarchiveLedger,
     WireUnknown,
@@ -122,6 +124,8 @@ def to_intent(
         return ConvertedIntent(
             intent=ShowBalance(scope=wire.scope, convert_to=wire.convert_to), rounded_from=None
         )
+    if isinstance(wire, WireShowTransactions):
+        return ConvertedIntent(intent=ShowTransactions(), rounded_from=None)
     if isinstance(wire, WireSwitchLedger):
         return ConvertedIntent(intent=SwitchLedger(name_or_id=wire.name_or_id), rounded_from=None)
     if isinstance(wire, WireNewLedger):
