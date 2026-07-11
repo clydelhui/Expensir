@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from expensir.core.outbound import EditMessage, OutboundAction, PinChatMessage
 from expensir.db.models import Group, Ledger
 from expensir.domain.balances import net_positions
+from expensir.domain.fx import ResolvedRate, api_legs, group_pins, rate_from_cache, today_utc
 from expensir.domain.identity import display_names
 from expensir.domain.simplify import simplify
 from expensir.format.board import BoardLine, board_text
@@ -51,7 +52,7 @@ async def sync_board(
     board is created + pinned inline, right here under the per-group lock.
     """
     ledger = await session.get_one(Ledger, ledger_id)
-    text, markup = await _board_view(session, ledger)
+    text, markup = await _board_view(session, group, ledger)
     if ledger.board_message_id is None or ledger.board_chat_id is None:
         if ledger.status != "open":
             # a board pins forever (§13 never-delete): never mint one for a ledger
@@ -68,10 +69,14 @@ async def sync_board(
     ]
 
 
-async def suggested_transfers(session: AsyncSession, ledger_id: int) -> list[BoardLine]:
+async def suggested_transfers(
+    session: AsyncSession, ledger_id: int, net: dict[int, dict[str, int]] | None = None
+) -> list[BoardLine]:
     """Union over currencies of simplify's transfers, in stable order (§7.4) —
-    the board shows them all, the settle sheet filters to one pair (ADR-0007)."""
-    net = await net_positions(session, ledger_id)
+    the board shows them all, the settle sheet filters to one pair (ADR-0007).
+    Pass `net` when the caller already replayed the ledger, so it isn't replayed twice."""
+    if net is None:
+        net = await net_positions(session, ledger_id)
     by_currency: dict[str, dict[int, int]] = {}
     for user_id, currencies in net.items():
         for currency, minor in currencies.items():
@@ -91,9 +96,35 @@ async def suggested_transfers(session: AsyncSession, ledger_id: int) -> list[Boa
     ]
 
 
-async def _board_view(session: AsyncSession, ledger: Ledger) -> tuple[str, InlineKeyboard | None]:
+async def _board_view(
+    session: AsyncSession, group: Group, ledger: Ledger
+) -> tuple[str, InlineKeyboard | None]:
     transfers = await suggested_transfers(session, ledger.id)
-    return board_text(ledger_name=ledger.name, transfers=transfers), board_keyboard(transfers)
+    home = group.home_currency
+    rates = await board_rates(session, group, transfers)
+    return (
+        board_text(ledger_name=ledger.name, transfers=transfers, home=home, rates=rates),
+        board_keyboard(transfers),
+    )
+
+
+async def board_rates(
+    session: AsyncSession, group: Group, transfers: list[BoardLine]
+) -> dict[str, ResolvedRate | None] | None:
+    """The ≈ layer's rates for a board render, from pins + the CACHE only — this
+    runs inside the locked write transaction, where FX transport is forbidden
+    (§0.11): a stale cache renders dated; reads refresh it (§13). Two batched
+    queries total, however many currencies are in play — the lock stays short."""
+    home = group.home_currency
+    if home is None:
+        return None
+    currencies = {t.currency for t in transfers if t.currency != home}
+    if not currencies:
+        return {}
+    pins = await group_pins(session, group.id)
+    legs = await api_legs(session, currencies | {home})
+    today = today_utc()
+    return {c: rate_from_cache(pins, legs, c, home, today=today) for c in currencies}
 
 
 async def _create_board(

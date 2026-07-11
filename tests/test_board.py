@@ -94,7 +94,14 @@ async def test_board_simplifies_each_currency_independently(deps):
     )
 
     [board_edit] = [a for a in outbound if a.kind == "edit_message"]
-    assert board_edit.text == ("📒 Japan Trip • Board\nBob → Alice EUR 30.00\nBob → Alice JPY 400")
+    # home is EUR with no JPY rate available (#16): the JPY bucket renders honestly
+    # as (≈ n/a) and stays an explicit remainder on the total line — never blocking
+    assert board_edit.text == (
+        "📒 Japan Trip • Board\n"
+        "Bob → Alice EUR 30.00\n"
+        "Bob → Alice JPY 400 (≈ n/a)\n"
+        "Total outstanding ≈ EUR 30.00 + JPY 400 (≈ n/a)"
+    )
 
 
 async def test_newledger_creates_and_pins_its_own_board(deps):

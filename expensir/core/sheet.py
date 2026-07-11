@@ -15,14 +15,20 @@ from expensir.format.render import settle_sheet_reply
 
 
 async def sheet_view(
-    session: AsyncSession, ledger: Ledger, a: User, b: User
+    session: AsyncSession,
+    ledger: Ledger,
+    a: User,
+    b: User,
+    net: dict[int, dict[str, int]] | None = None,
 ) -> tuple[str, InlineKeyboard | None]:
     """Render the pair's sheet: solver-suggested transfers only, both directions,
     one line per currency. No transfers -> "Nothing to settle" (ADR-0007: no
     reverse credit invented from pairwise history)."""
     pair = {a.id, b.id}
     transfers = [
-        t for t in await suggested_transfers(session, ledger.id) if {t.from_id, t.to_id} == pair
+        t
+        for t in await suggested_transfers(session, ledger.id, net=net)
+        if {t.from_id, t.to_id} == pair
     ]
     # stable pair order regardless of who asked: the sheet is identical both ways
     first, second = sorted((a, b), key=lambda u: u.id)

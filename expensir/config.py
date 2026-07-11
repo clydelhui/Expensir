@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # so a hung call can't block a webhook for minutes (§12).
     llm_timeout_seconds: float = 30.0
     pending_ttl_minutes: int = 15  # proposal TTL (§10, §17)
+    # display rates (§7.5): Frankfurter — free, no key, ECB daily, EUR-based.
+    # DISPLAY ONLY; an outage degrades ≈ lines to cached/dated/(≈ n/a), nothing else.
+    fx_api_base: str = "https://api.frankfurter.dev"
 
     @field_validator(
         "public_url",

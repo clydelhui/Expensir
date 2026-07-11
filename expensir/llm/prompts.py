@@ -56,6 +56,11 @@ never the new description.
 - set_home_currency — the group-wide display currency. {"kind":"set_home_currency","currency":ISO}
 - set_logging_currency — the current ledger's default currency for NEW expenses.
   {"kind":"set_logging_currency","currency":ISO}
+- set_fx_rate — pin a display exchange rate between two currencies.
+  {"kind":"set_fx_rate","base":ISO,"quote":ISO,"rate":DECIMAL-STRING-or-null}
+  The rate is a string as stated; null when they ask to pin "today's" rate without a number.
+- clear_fx_rate — unpin a rate / go back to live rates.
+  {"kind":"clear_fx_rate","base":ISO,"quote":ISO}
 - setup — asking to register/add a person as a member. {"kind":"setup"}
 - undo_redo — asking to undo or redo ANYTHING. {"kind":"undo_redo"}
 - unknown — anything you cannot confidently map. {"kind":"unknown","reason":SHORT-TEXT}
@@ -98,6 +103,8 @@ Examples:
 "reopen the Japan ledger" -> {"kind":"unarchive_ledger","name_or_id":"Japan"}
 "set our home currency to euros" -> {"kind":"set_home_currency","currency":"EUR"}
 "log this ledger in yen" -> {"kind":"set_logging_currency","currency":"JPY"}
+"pin the rate 1 usd = 1.35 sgd" -> {"kind":"set_fx_rate","base":"USD","quote":"SGD","rate":"1.35"}
+"go back to the live usd rate" (home SGD) -> {"kind":"clear_fx_rate","base":"USD","quote":"SGD"}
 "add Carol" -> {"kind":"setup"}
 "undo that" -> {"kind":"undo_redo"}
 "I paid 30 to redo the paint job" -> {"kind":"add_expense","payer_ref":"me","amount":"30",\

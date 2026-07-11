@@ -104,6 +104,27 @@ class WireSetLoggingCurrency(BaseModel):
     confidence: float | None = None
 
 
+class WireSetFxRate(BaseModel):
+    """Pin a DISPLAY rate (§7.5). rate is a decimal string like every wire
+    amount; None (the fetch-and-pin form) is slash-only — the app answers with
+    a /setrate pointer instead of fetching mid-proposal."""
+
+    kind: Literal["set_fx_rate"] = "set_fx_rate"
+    base: str
+    quote: str
+    rate: str | None = None
+    confidence: float | None = None
+
+
+class WireClearFxRate(BaseModel):
+    """Remove a pin — the pair falls back to live daily rates (§7.5)."""
+
+    kind: Literal["clear_fx_rate"] = "clear_fx_rate"
+    base: str
+    quote: str
+    confidence: float | None = None
+
+
 class WireSetup(BaseModel):
     """The extractor only signals the KIND — targets come from the message's
     reply/text_mention entities, the only shapes carrying account ids (§11)."""
@@ -140,6 +161,8 @@ WireResult = Annotated[
     | WireUnarchiveLedger
     | WireSetHomeCurrency
     | WireSetLoggingCurrency
+    | WireSetFxRate
+    | WireClearFxRate
     | WireSetup
     | WireUnknown
     | WireUndoRedo,

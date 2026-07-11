@@ -69,6 +69,27 @@ class SetLoggingCurrency(BaseModel):  # active ledger's new-expense default (ADR
     currency: str
 
 
+class SetFxRate(BaseModel):
+    """Pin a DISPLAY rate for ≈/convert (§7.5): covers the UNORDERED pair, frozen
+    until re-pinned, cleared, or undone. Never touches ledger math (ADR-0001)."""
+
+    kind: Literal["set_fx_rate"] = "set_fx_rate"
+    base: str
+    quote: str
+    # None = fetch-and-pin: the HANDLER resolves it to a concrete number BEFORE the
+    # lock (§7.5), so apply_intent never sees None and never touches FX transport
+    rate: float | None = None
+
+
+class ClearFxRate(BaseModel):
+    """/autorate: remove a pin — the pair falls back to live daily rates (§7.5).
+    A field flip (§8): before_image is the deleted pin, Undo restores it."""
+
+    kind: Literal["clear_fx_rate"] = "clear_fx_rate"
+    base: str
+    quote: str  # unordered, like the pin it clears
+
+
 class NewLedger(BaseModel):
     kind: Literal["new_ledger"] = "new_ledger"
     name: str
@@ -136,6 +157,8 @@ Intent = Annotated[
     | EditExpense
     | SetHomeCurrency
     | SetLoggingCurrency
+    | SetFxRate
+    | ClearFxRate
     | NewLedger
     | SwitchLedger
     | ArchiveLedger

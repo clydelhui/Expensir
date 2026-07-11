@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Index, String
+from sqlalchemy import JSON, BigInteger, DateTime, Float, ForeignKey, Index, String, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -154,6 +154,51 @@ class Settlement(Base):
     created_by_action_id: Mapped[int] = mapped_column(ForeignKey("actions.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FxRate(Base):
+    """A display rate (§7.5) — DISPLAY ONLY, never in ledger math (ADR-0001).
+
+    One row per (group, pair, source), UPSERTED in place — no history. Manual rows
+    are one group's pinned opinion on an UNORDERED pair (group_id set; either
+    direction restates the same row; the unordered half is app-maintained under
+    the per-group lock). API rows are deployment-global EUR-based facts
+    (group_id NULL), refreshed by READS with no shared lock — the partial unique
+    indexes below are the backstop against concurrent duplicate inserts.
+    Partial because a plain UNIQUE never collides on NULL group_ids (PG+SQLite)."""
+
+    __tablename__ = "fx_rates"
+    __table_args__ = (
+        Index(
+            "ux_fx_rates_global_pair",
+            "base_currency",
+            "quote_currency",
+            "source",
+            unique=True,
+            sqlite_where=text("group_id IS NULL"),
+            postgresql_where=text("group_id IS NULL"),
+        ),
+        Index(
+            "ux_fx_rates_group_pair",
+            "group_id",
+            "base_currency",
+            "quote_currency",
+            "source",
+            unique=True,
+            sqlite_where=text("group_id IS NOT NULL"),
+            postgresql_where=text("group_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    group_id: Mapped[int | None] = mapped_column(ForeignKey("groups.id"))
+    base_currency: Mapped[str] = mapped_column(String(3))
+    quote_currency: Mapped[str] = mapped_column(String(3))
+    rate: Mapped[float] = mapped_column(Float)  # a ratio, not money — floats are fine here
+    source: Mapped[str] = mapped_column(String)  # 'manual' | 'api'
+    # manual: the pin moment (frozen from then on); api: when WE fetched (UTC-day TTL, §7.5)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    set_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))  # NULL for api rows
 
 
 class PendingIntent(Base):

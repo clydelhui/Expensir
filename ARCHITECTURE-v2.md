@@ -334,7 +334,18 @@ class SetFxRate(BaseModel):        # pin a DISPLAY rate for ≈ / convert
     kind: Literal["set_fx_rate"] = "set_fx_rate"
     base: str
     quote: str
-    rate: float | None = None      # None -> fetch from Frankfurter
+    rate: float | None = None      # None -> fetch-and-pin: the HANDLER resolves it to a
+                                   #   concrete number via Frankfurter BEFORE the lock, so
+                                   #   apply_intent never sees None and never touches FX
+                                   #   transport (§7.5). Fetch fails -> reject loudly with
+                                   #   guidance, write nothing. Reply copy must say the
+                                   #   rate is now frozen (it pins as 'manual').
+
+class ClearFxRate(BaseModel):      # /autorate: remove a pin -> back to live daily rates
+    kind: Literal["clear_fx_rate"] = "clear_fx_rate"
+    base: str
+    quote: str                     # unordered pair, like the pin it clears (§7.5)
+                                   # pair not pinned -> guidance, nothing written
 
 class Setup(BaseModel):            # register pre-existing members (§11)
     kind: Literal["setup"] = "setup"
@@ -347,7 +358,7 @@ class Unknown(BaseModel):          # LLM couldn't map it -> ask to rephrase
 Intent = Annotated[
     Union[AddExpense, SettleUp, ShowBalance, DeleteExpense, EditExpense,
           NewLedger, SwitchLedger, ArchiveLedger, UnarchiveLedger, SetHomeCurrency,
-          SetLoggingCurrency, SetFxRate, Setup, Unknown],
+          SetLoggingCurrency, SetFxRate, ClearFxRate, Setup, Unknown],
     Field(discriminator="kind"),
 ]
 ```
@@ -359,7 +370,7 @@ Intent = Annotated[
 **Undoability of each kind.** `add_expense`, `settle_up` (with amount; the no-amount settle sheet
 is a read), `delete_expense`, `edit_expense`,
 `new_ledger`, `switch_ledger`, `archive_ledger`, `unarchive_ledger`, `set_home_currency`, `set_logging_currency`,
-`set_fx_rate` all carry an Undo button. **`setup` (registration) is permanent and carries no Undo
+`set_fx_rate`, `clear_fx_rate` all carry an Undo button. **`setup` (registration) is permanent and carries no Undo
 button.** `show_balance` and `unknown` are reads/no-ops and write no action row.
 
 ---
@@ -395,8 +406,18 @@ settlements      (id, ledger_id, from_user, to_user, amount_minor, currency,
                   created_by_action_id, created_at, deleted_at)
                    -- always single-currency, concrete amount; a recorded stated fact (ADR-0002)
 
-fx_rates         (id, base_currency, quote_currency, rate,
-                  source['manual'|'api'], fetched_at, set_by)   -- group-wide; manual beats api
+fx_rates         (id, group_id NULLABLE, base_currency, quote_currency, rate,
+                  source['manual'|'api'], fetched_at, set_by)   -- manual beats api
+                   -- manual rows are group-scoped (group_id set): a pin is one group's
+                   --   opinion about a rate, like home_currency. API rows are
+                   --   deployment-global (group_id NULL): ECB rates are universal facts,
+                   --   and one group's refetch warms the cache for every group.
+                   -- ONE row per (group_id, base, quote, source), UPSERTED in place —
+                   --   no history. Manual rows: one per UNORDERED pair — re-pinning in
+                   --   either direction upserts the same row (§7.5); the reverse
+                   --   direction resolves as the reciprocal. set_fx_rate is a field
+                   --   flip (§8): undo restores the before_image (which may be "no pin
+                   --   existed").
                    -- DISPLAY ONLY
 
 actions          (id, ledger_id, actor_user_id, kind, intent_json JSON, before_image JSON,
@@ -569,21 +590,45 @@ def simplify(net_ccy: dict[user, int]) -> list[(debtor, creditor, minor)]:
 Board "who owes whom" = union over currencies of `simplify(net[·][ccy])`.
 
 ### 7.5 FX (`domain/fx.py`) — DISPLAY ONLY
-- Resolve `FROM→TO`: latest manual `fx_rates` row wins (never auto-refreshed); else Frankfurter,
-  cached group-wide with a **same-calendar-day TTL** — a render that finds `fetched_at` isn't today
-  refetches (ECB publishes daily). If the refetch fails, fall back to the cached rate and surface
-  its date in display.
-- Frankfurter is EUR-based; **triangulate** non-EUR pairs via EUR.
+- Resolve `FROM→TO`: the group's manual pin on the pair wins (never auto-refreshed) — a pin
+  covers the **unordered pair**, so the reverse direction resolves as the reciprocal; else
+  Frankfurter, cached with a **same-calendar-day TTL** — a render that finds `fetched_at` isn't
+  today refetches (ECB publishes daily). "Today" is the **UTC calendar day**, keyed on when *we*
+  fetched, not the ECB reference date — so weekends (Friday's rate, today's fetch) cache cleanly
+  instead of refetching every render. If the refetch fails, fall back to the cached rate and
+  surface its date in display (the rates footer, §13).
+- Frankfurter is EUR-based; **triangulate** non-EUR pairs via EUR. Triangulation uses API rows
+  only — a pin applies to exactly its own pair, never as a leg of another pair's triangulation.
 - Unsupported currency, or API down with nothing cached → no rate; callers render `(≈ n/a)`.
   Never guess, never block.
+- `/setrate BASE QUOTE` with no number = **fetch-and-pin**: fetch today's rate, pin it as
+  `manual` (frozen from that moment — `fetched_at` is the pin time). The fetch happens in the
+  handler, outside the lock, so `apply_intent` only ever receives a concrete rate. Fetch
+  failure → reject loudly with guidance (offer the explicit-number form), nothing written.
+- `/autorate BASE QUOTE` (`clear_fx_rate`) removes the group's pin on the pair → the pair
+  falls back to live daily rates. A field flip: `before_image` is the deleted pin, Undo
+  restores it. Pair not pinned → guidance ("USD→SGD isn't pinned — see /rates"), never silence.
 - FX never participates in `apply_intent` or settlement math.
 
 ### 7.6 Convert & equivalents (`domain/convert.py`) — pure reads, active ledger only
 - `≈` equivalent: convert a bucket to the group **home currency** at the current rate, format to the
   home currency's `minor_digits`. Nothing stored.
-- `/convert <TARGET>`: convert every bucket of the active ledger to TARGET and sum. Read-only.
-- `/balance`: each currency bucket + its `≈ home` line + a total `≈ home` line, labeled approximate.
-  Sealed to the active ledger; says nothing about other ledgers (§0.10).
+- `/convert <TARGET>`: consolidate **per member** — collapse each member's multi-currency net
+  into one `≈ TARGET` figure, one line per member (a ledger-wide sum is always ≈0 by pool
+  construction). Buckets with no rate stay unconverted as an explicit remainder:
+  `Alice owes ≈ 67.50 SGD + 3,000 JPY (≈ n/a)`. Labeled approximate, ends with the rates
+  footer (§13). TARGET = home currency is legal. Missing/unrecognized TARGET → guidance with
+  a copy-pasteable example. Read-only.
+- `/balance`: each currency bucket + its `≈ home` line + a total `≈ home` line, labeled approximate,
+  ending with the rates footer (§13). Sealed to the active ledger; says nothing about other
+  ledgers (§0.10).
+- `/rates`: the group's pins first (rate, who pinned, when), each with the live ECB figure as a
+  reference — `📌 1 USD = 1.3500 SGD — pinned by Alice, 3 Jul (ECB today: 1.3388)` — so drifted
+  pins are visible at a glance; then API rates for pairs in play on the active ledger (bucket
+  currencies × home), dated when stale. Never other groups' concerns (API rows are shared;
+  their display is not). Ends with copy-pasteable examples: pin (`/setrate USD SGD 1.35`),
+  back to live (`/autorate USD SGD`), consolidate (`/convert SGD`). Empty state still answers
+  with those examples — never silence.
 
 ---
 
@@ -601,6 +646,7 @@ Reversal model:
   `created_by_action_id = me`**.
 - Field/pointer flips (`switch_ledger`, `archive_ledger`, `unarchive_ledger`, `new_ledger`'s
   active-pointer change, `set_home_currency`, `set_logging_currency`, `set_fx_rate`,
+  `clear_fx_rate` (before_image = the deleted pin; undo restores it),
   `edit_expense`) → store a minimal `before_image` and restore it on undo.
 
 Active-ledger invariant maintenance (ADR-0004):
@@ -763,6 +809,7 @@ re-created and re-pinned on the next mutation. Lifecycle event — no action row
 | "switch to Japan" / "archive this ledger" / "reopen the Japan ledger" | ledger intents |
 | "delete the dinner expense" / reply "delete this" | `delete_expense` (resolved via §11) |
 | "pin the rate 1 usd = 1.35 sgd" | `set_fx_rate` |
+| "go back to the live usd rate" | `clear_fx_rate` |
 | "add Carol" (by reply/tap) | `setup` (bare username → guidance) |
 | "export everything" | export flow (operator for `all`) |
 | "undo that" | `unknown` → reply pointing to the ↩️ button |
@@ -816,10 +863,21 @@ holds a pooled connection.
   best-effort). Each debt line: `from → to  AMT CCY (≈ home)  [Settle]`. `[Settle]` is WYSIWYG
   (ADR-0006): it records the shown amount when the board is fresh, or warns + refreshes when stale.
   Board lines themselves never carry Undo; the short result a settle posts does.
+  **Rates footer:** when the board shows any `≈` line, it ends with one footer line listing the
+  rate behind each pair in play (non-home bucket currency → home): pins as
+  `1 USD = 1.3500 SGD (pinned)`, API rates as `(ECB)` — dated (`ECB, 9 Jul`) only when the rate
+  isn't from today (the §7.5 stale-surfacing). Pairs with no current bucket don't appear; the
+  full listing is `/rates`. Balance replies carry the same footer. No third pinned message.
   **Read-triggered `≈` refresh:** ledger reads (`/balance`, `/convert`, the settle sheet) that find
   the board's API rates weren't fetched today re-render the board with fresh rates — fetch outside
   the lock, then render + edit **under the per-group lock** so it can't race a concurrent write's
   board edit. Manually pinned rates never trigger this.
+  **Group-scoped flips refresh the active board:** `set_fx_rate`, `clear_fx_rate`, and
+  `set_home_currency` (and their undos) change every `≈` line — their action rows stamp the
+  **active ledger's id** (the `_append_action` default), so the ordinary every-mutation board
+  sync refreshes the **active ledger's board only**. Non-active boards are knowingly stale
+  (reads are sealed to the active ledger, so nothing can refresh them); they catch up when
+  their ledger is next active and renders.
 
 ---
 
@@ -893,7 +951,7 @@ Deploy: run Alembic migrations + `setWebhook` as a one-shot release step, not on
 11. **Vision path.** Receipt photo (mention/reply) → `extract_vision` → same `AddExpense` → same
     confirm. *Done when:* a sample receipt proposes a plausible expense (mocked).
 12. **Currency display: FX + convert + ≈.** `fx.py` (Frankfurter + cache + triangulation, display
-    only), `/setrate`, `/rates`, `/convert`, `≈ home` lines on board + balance. *Done when:* board
+    only), `/setrate`, `/autorate`, `/rates`, `/convert`, `≈ home` lines on board + balance. *Done when:* board
     shows each currency with its home equivalent; `(≈ n/a)` when FX unavailable; settlement math never
     calls FX.
 13. **Pinned balance board.** `format/board.py`; one edited-in-place message per ledger under the

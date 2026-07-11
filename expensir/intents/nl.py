@@ -12,10 +12,12 @@ from expensir.domain.money import to_minor
 from expensir.intents.schema import (
     AddExpense,
     ArchiveLedger,
+    ClearFxRate,
     DeleteExpense,
     EditExpense,
     Intent,
     NewLedger,
+    SetFxRate,
     SetHomeCurrency,
     SetLoggingCurrency,
     SettleUp,
@@ -29,10 +31,12 @@ from expensir.intents.schema import (
 from expensir.llm.wire import (
     WireAddExpense,
     WireArchiveLedger,
+    WireClearFxRate,
     WireDeleteExpense,
     WireEditExpense,
     WireNewLedger,
     WireResult,
+    WireSetFxRate,
     WireSetHomeCurrency,
     WireSetLoggingCurrency,
     WireSettleUp,
@@ -121,8 +125,22 @@ def to_intent(
     if isinstance(wire, WireSettleUp):
         return _settle_up(wire, logging_currency, home_currency)
     if isinstance(wire, WireShowBalance):
+        # validate at the NL input edge (ADR-0009), like every stated code
+        convert_to = (
+            require_known_currency(wire.convert_to) if wire.convert_to is not None else None
+        )
         return ConvertedIntent(
-            intent=ShowBalance(scope=wire.scope, convert_to=wire.convert_to), rounded_from=None
+            intent=ShowBalance(scope=wire.scope, convert_to=convert_to), rounded_from=None
+        )
+    if isinstance(wire, WireSetFxRate):
+        return _set_fx_rate(wire)
+    if isinstance(wire, WireClearFxRate):
+        return ConvertedIntent(
+            intent=ClearFxRate(
+                base=require_known_currency(wire.base),
+                quote=require_known_currency(wire.quote),
+            ),
+            rounded_from=None,
         )
     if isinstance(wire, WireShowTransactions):
         return ConvertedIntent(intent=ShowTransactions(), rounded_from=None)
@@ -176,6 +194,28 @@ def to_intent(
         return ConvertedIntent(intent=Unknown(reason=wire.reason), rounded_from=None)
     # WireUndoRedo never reaches here: the handler answers it before conversion (§9)
     raise AssertionError(f"unhandled wire kind: {wire.kind}")
+
+
+def _set_fx_rate(wire: WireSetFxRate) -> ConvertedIntent:
+    """A stated rate pins via propose/confirm like any mutation. The no-rate form
+    (fetch-and-pin) is slash-only: resolving it needs a pre-lock fetch the
+    proposal loop doesn't do — point at the command instead of guessing (§7.5)."""
+    base = require_known_currency(wire.base)
+    quote = require_known_currency(wire.quote)
+    if wire.rate is None:
+        raise ValueError(
+            f"To pin today's live rate, use the command: /setrate {base} {quote} — "
+            f"or state a number: /setrate {base} {quote} 1.35"
+        )
+    try:
+        rate = float(wire.rate)
+    except ValueError:
+        raise ValueError(
+            f"I couldn't read {wire.rate!r} as a rate — e.g. /setrate {base} {quote} 1.35"
+        ) from None
+    if rate <= 0:
+        raise ValueError("A rate must be a positive number — nothing was pinned.")
+    return ConvertedIntent(intent=SetFxRate(base=base, quote=quote, rate=rate), rounded_from=None)
 
 
 def _settle_up(

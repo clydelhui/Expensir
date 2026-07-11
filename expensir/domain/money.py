@@ -28,6 +28,14 @@ def minor_digits(currency: str) -> int:
     return MINOR_DIGITS.get(currency.upper(), DEFAULT_MINOR_DIGITS)
 
 
+def round_half_up(scaled: Decimal) -> int:
+    """Half-up at the minor-unit boundary — the ONE rounding rule for money-shaped
+    display and parsing alike (§3, §7.6)."""
+    with localcontext() as ctx:
+        ctx.rounding = "ROUND_HALF_UP"
+        return int(scaled.to_integral_value())
+
+
 def to_minor(amount_str: str, currency: str) -> tuple[int, bool]:
     """Parse a typed major-unit amount into integer minor units.
 
@@ -43,9 +51,7 @@ def to_minor(amount_str: str, currency: str) -> tuple[int, bool]:
 
     code = currency.upper()
     scaled = amount * (10 ** minor_digits(code))
-    with localcontext() as ctx:
-        ctx.rounding = "ROUND_HALF_UP"
-        minor = int(scaled.to_integral_value())
+    minor = round_half_up(scaled)
     if minor == 0:
         raise ValueError(
             f"{amount_str} is smaller than the smallest {code} unit — nothing to record"

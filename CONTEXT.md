@@ -47,7 +47,15 @@ The default currency for *new* expenses in a given ledger. Set per ledger; overr
 _Avoid_: default currency, ledger currency
 
 **Equivalent** (`≈`):
-The home-currency rendering of an amount that is natively in another currency, computed at today's rate and labelled approximate. Pure display; never stored; shows `(≈ n/a)` when no rate is available.
+The home-currency rendering of an amount that is natively in another currency, computed at the pair's current display rate — the group's pinned rate if one exists, else the live rate — and labelled approximate. Pure display; never stored; shows `(≈ n/a)` when no rate is available.
+
+**Pinned rate**:
+A group's own display rate for a currency pair, frozen at the moment it is set and used in place of the live rate until the group changes it or returns the pair to live rates. A pin belongs to the pair, not a direction — the reverse direction is its reciprocal — and speaks only for its own pair, never as a step in deriving another pair's rate. One group's pin is invisible to every other group. Display only, like all rates.
+_Avoid_: manual rate, custom rate, fixed rate
+
+**Live rate**:
+The externally published daily exchange rate the bot fetches and shows when a pair has no pinned rate. Refreshed at most once a calendar day; when today's fetch fails, yesterday's known rate is shown with its date rather than nothing. Shown alongside a pinned rate as a reference, so a drifted pin is visible at a glance.
+_Avoid_: API rate (the mechanism, not the thing), market rate, official rate
 
 **Recognized currency**:
 A circulating ISO 4217 code — the only kind of currency any input may introduce, whatever the door (slash command, natural language, receipt photo). Non-circulating codes (gold, SDRs, fund codes, "no currency") are not recognized. Recognition is checked at the input edge only: stored transactions and imported backups keep whatever code they were written with, even one since retired from the standard. Distinct from FX support — a recognized currency may still have no rate and render `(≈ n/a)`.

@@ -11,11 +11,12 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from expensir.core.locking import per_group_lock
-from expensir.db.models import Action, Expense, ExpenseSplit, Group, Ledger, User, utcnow
+from expensir.db.models import Action, Expense, ExpenseSplit, FxRate, Group, Ledger, User, utcnow
 from expensir.domain.allocate import allocate
 from expensir.domain.balances import net_positions
 from expensir.domain.currency import require_known_currency
 from expensir.domain.errors import AmbiguousRef, Rejection
+from expensir.domain.fx import find_pin, pin_image
 from expensir.domain.identity import (
     register_setup_target,
     registered_members,
@@ -28,10 +29,12 @@ from expensir.domain.settle import record_settlement
 from expensir.intents.schema import (
     AddExpense,
     ArchiveLedger,
+    ClearFxRate,
     DeleteExpense,
     EditExpense,
     Intent,
     NewLedger,
+    SetFxRate,
     SetHomeCurrency,
     SetLoggingCurrency,
     SettleUp,
@@ -153,6 +156,10 @@ async def _apply(intent: Intent, ctx: ApplyContext) -> Applied | None:
         return await _apply_edit_expense(intent, ctx)
     if isinstance(intent, SetHomeCurrency):
         return await _apply_set_home_currency(intent, ctx)
+    if isinstance(intent, SetFxRate):
+        return await _apply_set_fx_rate(intent, ctx)
+    if isinstance(intent, ClearFxRate):
+        return await _apply_clear_fx_rate(intent, ctx)
     if isinstance(intent, SetLoggingCurrency):
         return await _apply_set_logging_currency(intent, ctx)
     if isinstance(intent, NewLedger):
@@ -400,7 +407,72 @@ async def _apply_set_home_currency(intent: SetHomeCurrency, ctx: ApplyContext) -
     require_known_currency(intent.currency)  # ADR-0009
     before = {"home_currency": ctx.group.home_currency}
     ctx.group.home_currency = intent.currency
-    action = await _append_action(ctx, intent, before_image=before)
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=_active_ledger(ctx))
+    return AppliedFlip(action_id=action.id)
+
+
+def _active_ledger(ctx: ApplyContext) -> int:
+    """Group-scoped flips stamp the ACTIVE ledger (§13), never a confirmed
+    proposal's pinned one — the pin means "commit HERE", but a group-wide flip
+    has no here, and the board that must refresh is the one people are watching."""
+    assert ctx.group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+    return ctx.group.active_ledger_id
+
+
+async def _apply_set_fx_rate(intent: SetFxRate, ctx: ApplyContext) -> AppliedFlip:
+    """Pin a display rate (§7.5): UPSERT the group's one row for the unordered pair.
+
+    A field flip (§8): before_image is the prior pin (None = wasn't pinned)."""
+    actor = _require_actor(ctx)
+    require_known_currency(intent.base)  # ADR-0009: /setrate validates its inputs
+    require_known_currency(intent.quote)
+    if intent.base == intent.quote:
+        raise Rejection("🤷 A currency doesn't need a rate against itself — nothing was pinned.")
+    # the handler resolves fetch-and-pin to a concrete number BEFORE the lock (§7.5)
+    assert intent.rate is not None
+    if intent.rate <= 0:
+        # the slash parser already refuses these; this guards the NL path (§12)
+        raise Rejection("🤷 A rate must be a positive number — nothing was pinned.")
+
+    pin = await find_pin(ctx.session, ctx.group.id, intent.base, intent.quote)
+    before = {"pin": pin_image(pin)}
+    if pin is None:
+        ctx.session.add(
+            FxRate(
+                group_id=ctx.group.id,
+                base_currency=intent.base,
+                quote_currency=intent.quote,
+                rate=intent.rate,
+                source="manual",
+                set_by=actor.id,
+            )
+        )
+    else:
+        # one row per UNORDERED pair: a re-pin in either direction restates it
+        pin.base_currency, pin.quote_currency = intent.base, intent.quote
+        pin.rate = intent.rate
+        pin.fetched_at = utcnow()
+        pin.set_by = actor.id
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=_active_ledger(ctx))
+    return AppliedFlip(action_id=action.id)
+
+
+async def _apply_clear_fx_rate(intent: ClearFxRate, ctx: ApplyContext) -> AppliedFlip:
+    """/autorate (§7.5): delete the pair's pin — back to live daily rates.
+
+    A field flip (§8): before_image is the deleted pin, Undo restores it."""
+    _require_actor(ctx)
+    require_known_currency(intent.base)  # ADR-0009
+    require_known_currency(intent.quote)
+    pin = await find_pin(ctx.session, ctx.group.id, intent.base, intent.quote)
+    if pin is None:
+        raise Rejection(
+            f"🤷 {intent.base}→{intent.quote} isn't pinned — it already follows the "
+            f"live daily rate. /rates shows what's pinned."
+        )
+    before = {"pin": pin_image(pin)}
+    await ctx.session.delete(pin)
+    action = await _append_action(ctx, intent, before_image=before, ledger_id=_active_ledger(ctx))
     return AppliedFlip(action_id=action.id)
 
 

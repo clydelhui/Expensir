@@ -1,6 +1,7 @@
 """Transport-agnostic entrypoint: dispatch(update_dict) -> list[OutboundAction] (§0.5)."""
 
 import contextlib
+import dataclasses
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from expensir.core.outbound import (
     SendMessage,
 )
 from expensir.core.sheet import sheet_view
-from expensir.db.models import Action, Expense, Group, Ledger, PendingIntent, User
+from expensir.db.models import Action, Expense, FxRate, Group, Ledger, PendingIntent, User
 from expensir.domain.apply import (
     Applied,
     AppliedExpense,
@@ -36,8 +37,18 @@ from expensir.domain.apply import (
     split_shares,
 )
 from expensir.domain.balances import net_positions
-from expensir.domain.currency import resolve_currency
+from expensir.domain.currency import require_known_currency, resolve_currency
 from expensir.domain.errors import AmbiguousExpense, AmbiguousRef, Rejection
+from expensir.domain.fx import (
+    FxProvider,
+    api_legs,
+    api_rate,
+    api_rate_from_legs,
+    equivalents_view,
+    fmt_rate,
+    refresh_api_rates,
+    today_utc,
+)
 from expensir.domain.identity import (
     ambiguous_guidance,
     display_names,
@@ -72,8 +83,10 @@ from expensir.format.keyboards import (
 from expensir.format.render import (
     LedgerLine,
     MemberLine,
+    PinView,
     action_proposal_reply,
     balance_reply,
+    convert_reply,
     delete_reply,
     edit_reply,
     expense_pick_stage_reply,
@@ -83,6 +96,7 @@ from expensir.format.render import (
     members_reply,
     pick_stage_reply,
     proposal_reply,
+    rates_reply,
     settle_reply,
 )
 from expensir.format.transactions import transactions_fallback_reply, transactions_reply
@@ -92,7 +106,9 @@ from expensir.intents.commands import (
     EDIT_USAGE,
     ParsedExpense,
     parse_archive,
+    parse_autorate,
     parse_balance,
+    parse_convert,
     parse_currency,
     parse_delete,
     parse_edit,
@@ -102,6 +118,8 @@ from expensir.intents.commands import (
     parse_members,
     parse_newledger,
     parse_percent,
+    parse_rates,
+    parse_setrate,
     parse_settle,
     parse_shares,
     parse_switch,
@@ -111,10 +129,12 @@ from expensir.intents.commands import (
 from expensir.intents.schema import (
     AddExpense,
     ArchiveLedger,
+    ClearFxRate,
     DeleteExpense,
     EditExpense,
     Intent,
     NewLedger,
+    SetFxRate,
     SetHomeCurrency,
     SetLoggingCurrency,
     SettleUp,
@@ -181,9 +201,14 @@ class Reply:
     text: str
     undo_action_id: int | None = None
     markup: InlineKeyboard | None = None
+    # a read that refreshed stale API rates re-renders the board (§13): the edit
+    # rides along as data, rendered under the lock like every board edit
+    board_sync: list[OutboundAction] = dataclasses.field(default_factory=list)
 
 
-CommandRunner = Callable[[dict[str, Any], AsyncSession, Group, User | None], Awaitable[Reply]]
+CommandRunner = Callable[
+    [dict[str, Any], AsyncSession, Group, User | None, "Deps"], Awaitable[Reply]
+]
 
 WELCOME = (
     "👋 Expensir is on the case!\n"
@@ -241,6 +266,13 @@ HELP = (
     "  also show a ≈ equivalent in it\n"
     "• /currency JPY — this ledger's own logging currency\n"
     "\n"
+    "💱 Exchange rates (display only — never used in the math)\n"
+    "• /setrate USD SGD 1.35 — pin the rate my ≈ figures use\n"
+    "  (leave the number off to pin today's live rate)\n"
+    "• /autorate USD SGD — unpin, back to the live daily rate\n"
+    "• /rates — what's pinned, and today's live rates\n"
+    "• /convert SGD — everyone's balance consolidated into one currency\n"
+    "\n"
     "💬 You can also just @mention me or reply to my messages in plain\n"
     'language — "alice paid 20 for coffee" — receipt photos included.'
 )
@@ -270,6 +302,8 @@ class Deps:
     # photo bytes for the vision door (issue #15); None leaves photos unanswered
     files: FileSource | None = None
     pending_ttl_minutes: int = 15  # proposal TTL (§10, §17)
+    # live display rates (§7.5); None (unconfigured) degrades to pins + (≈ n/a)
+    fx: FxProvider | None = None
 
 
 async def dispatch(update: dict[str, Any], deps: Deps) -> list[OutboundAction]:
@@ -728,6 +762,11 @@ def _committed_text(intent: Intent, applied: Applied, *, pinned_ledger_name: str
     if isinstance(intent, SetLoggingCurrency):
         assert isinstance(applied, AppliedLedgerOp)
         return _logging_currency_text(applied.ledger.name, intent.currency)
+    if isinstance(intent, SetFxRate):
+        assert intent.rate is not None  # NL never proposes the fetch-and-pin form (§7.5)
+        return _set_fx_rate_text(intent.base, intent.quote, intent.rate)
+    if isinstance(intent, ClearFxRate):
+        return _autorate_text(intent.base, intent.quote)
     raise AssertionError(f"unrendered confirmed kind: {intent.kind}")
 
 
@@ -757,6 +796,13 @@ def _home_currency_text(currency: str) -> str:
     return (
         f"🏠 Home currency set to {currency} — "
         f"other currencies will show a ≈ {currency} equivalent."
+    )
+
+
+def _set_fx_rate_text(base: str, quote: str, rate: float) -> str:
+    return (
+        f"📌 Pinned 1 {base} = {fmt_rate(rate)} {quote} for ≈ figures. "
+        f"Frozen until you /setrate again or /autorate {base} {quote}."
     )
 
 
@@ -1062,7 +1108,7 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
         runner = _RUNNERS.get(command or "")
         if runner is not None:
             try:
-                reply = await _run_command(runner, message, session, group, actor)
+                reply = await _run_command(runner, message, session, group, actor, deps)
             except AmbiguousRef as ambiguous:
                 # ambiguous reference resolution makes ANY intent fuzzy (§0.7):
                 # the slash door parks a pick-stage proposal too (§13)
@@ -1084,6 +1130,7 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
                     records_result_for_action_id=reply.undo_action_id,
                 ),
                 *board,
+                *reply.board_sync,
             ]
 
         reply_to = message.get("reply_to_message")
@@ -1256,7 +1303,7 @@ async def _handle_reply_to_pending(
             )
         ]
     try:
-        reply = await _nl_read_reply(intent, session, group, actor)
+        reply = await _nl_read_reply(intent, session, group, actor, deps)
     except AmbiguousRef as ambiguous:
         # a read can't host a pick-list stage: guidance, proposal untouched
         return [SendMessage(chat_id=pending.chat_id, text=ambiguous_guidance(ambiguous.ref))]
@@ -1265,7 +1312,10 @@ async def _handle_reply_to_pending(
     if reply is not None:
         # a read mid-decision runs inline; it is not a correction, so the
         # proposal (and its TTL) stays exactly as it was (issue #14 grill)
-        return [SendMessage(chat_id=pending.chat_id, text=reply.text, reply_markup=reply.markup)]
+        return [
+            SendMessage(chat_id=pending.chat_id, text=reply.text, reply_markup=reply.markup),
+            *reply.board_sync,
+        ]
     # a "me" the correction introduces is the REPLIER's (issue #14 grill); the
     # original proposer's refs were pinned at park time and echo back as id:<n>
     intent = nl.pin_me(intent, actor.id)
@@ -1494,10 +1544,11 @@ async def _run_nl_intent(
             wire, logging_currency=ledger.logging_currency, home_currency=group.home_currency
         )
     intent = converted.intent
-    reply = await _nl_read_reply(intent, session, group, actor)
+    reply = await _nl_read_reply(intent, session, group, actor, deps)
     if reply is not None:
         return [
-            SendMessage(chat_id=message["chat"]["id"], text=reply.text, reply_markup=reply.markup)
+            SendMessage(chat_id=message["chat"]["id"], text=reply.text, reply_markup=reply.markup),
+            *reply.board_sync,
         ]
     return await _propose(converted, message, session, group, actor, deps, ledger)
 
@@ -1551,7 +1602,7 @@ async def _resolve_expense_wire(
 
 
 async def _nl_read_reply(
-    intent: Intent, session: AsyncSession, group: Group, actor: User | None
+    intent: Intent, session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply | None:
     """Run an NL read/no-op immediately (§0.7); None means the intent is a mutation."""
     if isinstance(intent, Unknown):
@@ -1562,11 +1613,11 @@ async def _nl_read_reply(
             )
         )
     if isinstance(intent, ShowBalance):
-        return await _balance_reply(intent, session, group, actor)
+        return await _balance_reply(intent, session, group, actor, deps)
     if isinstance(intent, ShowTransactions):
         return await _transactions_reply(session, group)
     if isinstance(intent, SettleUp) and intent.amount_minor is None:
-        return await _sheet_reply(intent, session, group, actor)
+        return await _sheet_reply(intent, session, group, actor, deps)
     return None
 
 
@@ -1761,6 +1812,17 @@ async def _proposal_summary(
     if isinstance(intent, Setup):
         names = join_names([t.display_name for t in intent.targets])
         return f"Register {names} as members — this is permanent (no Undo)."
+    if isinstance(intent, SetFxRate):
+        assert intent.rate is not None  # NL never proposes the fetch-and-pin form (§7.5)
+        return (
+            f"📌 Pin 1 {intent.base} = {fmt_rate(intent.rate)} {intent.quote} for ≈ figures "
+            f"(display only, frozen until re-pinned or /autorate)."
+        )
+    if isinstance(intent, ClearFxRate):
+        return (
+            f"💱 Unpin {intent.base}→{intent.quote} — ≈ figures follow the live daily "
+            f"rate again."
+        )
     raise AssertionError(f"unproposable intent kind: {intent.kind}")
 
 
@@ -1793,6 +1855,7 @@ async def _run_command(
     session: AsyncSession,
     group: Group,
     actor: User | None,
+    deps: Deps,
 ) -> Reply:
     """Run a mutating command; on rejection every write it made rolls back (§0.9).
 
@@ -1801,13 +1864,13 @@ async def _run_command(
     """
     try:
         async with session.begin_nested():
-            return await runner(message, session, group, actor)
+            return await runner(message, session, group, actor, deps)
     except (Rejection, ValueError) as exc:
         return Reply(text=str(exc))
 
 
 async def _run_homecurrency(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     currency = parse_homecurrency(message["text"])
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
@@ -1816,8 +1879,123 @@ async def _run_homecurrency(
     return Reply(text=_home_currency_text(currency), undo_action_id=applied.action_id)
 
 
+async def _run_setrate(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
+) -> Reply:
+    parsed = parse_setrate(message["text"])
+    if parsed.rate is None:
+        # fetch-and-pin (§7.5): resolved HERE, before apply_intent takes the lock,
+        # so the domain layer never touches FX transport. Validate the codes first —
+        # a typo'd code corrects loudly (ADR-0009) instead of reading as "FX down"
+        require_known_currency(parsed.base)
+        require_known_currency(parsed.quote)
+        # the fetch rides the shared TTL cache (one triangulation, one formula),
+        # warming it for the next read; a stale leftover never pins silently —
+        # "pin today's rate" means today's
+        today = today_utc()
+        await refresh_api_rates(session, deps.fx, {parsed.base, parsed.quote}, today=today)
+        resolved = await api_rate(session, parsed.base, parsed.quote, today=today)
+        if resolved is None or resolved.stale:
+            raise Rejection(
+                f"🤷 I couldn't fetch {parsed.base}→{parsed.quote} right now — "
+                f"give me a number instead: /setrate {parsed.base} {parsed.quote} 1.35"
+            )
+        rate = resolved.rate
+    else:
+        rate = float(parsed.rate)
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(SetFxRate(base=parsed.base, quote=parsed.quote, rate=rate), ctx)
+    assert applied is not None
+    return Reply(
+        text=_set_fx_rate_text(parsed.base, parsed.quote, rate),
+        undo_action_id=applied.action_id,
+    )
+
+
+async def _run_convert(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
+) -> Reply:
+    target = parse_convert(message["text"])
+    intent = ShowBalance(convert_to=target)
+    return await _balance_reply(intent, session, group, actor, deps)
+
+
+async def _run_rates(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
+) -> Reply:
+    """/rates — a read (§0.7): the group's pins with live references, then API
+    rates for the pairs in play on the active ledger. Never other groups' concerns."""
+    parse_rates(message["text"])
+    today = today_utc()
+    home = group.home_currency
+    pins = (
+        (
+            await session.execute(
+                select(FxRate)
+                .where(FxRate.group_id == group.id, FxRate.source == "manual")
+                .order_by(FxRate.base_currency, FxRate.quote_currency)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ledger = await session.get_one(Ledger, group.active_ledger_id)
+    net = await net_positions(session, ledger.id)
+    pinned_pairs = {frozenset((p.base_currency, p.quote_currency)) for p in pins}
+    in_play_currencies = {
+        currency
+        for by_currency in net.values()
+        for currency, minor in by_currency.items()
+        # a fully-settled bucket is not in play: balance/board hide it, so do we
+        if minor
+        and home is not None
+        and currency != home
+        and frozenset((currency, home)) not in pinned_pairs
+    }
+    symbols = {s for p in pins for s in (p.base_currency, p.quote_currency)} | in_play_currencies
+    if in_play_currencies and home is not None:
+        symbols.add(home)
+    await refresh_api_rates(session, deps.fx, symbols, today=today)
+    legs = await api_legs(session, symbols)  # ONE batched read serves every line below
+    names = await display_names(session, [p.set_by for p in pins if p.set_by is not None])
+    pin_views = [
+        PinView(
+            base=p.base_currency,
+            quote=p.quote_currency,
+            rate=p.rate,
+            by_name=names.get(p.set_by, "someone") if p.set_by is not None else "someone",
+            on=p.fetched_at,
+            reference=api_rate_from_legs(legs, p.base_currency, p.quote_currency, today=today),
+        )
+        for p in pins
+    ]
+    in_play = {
+        currency: api_rate_from_legs(legs, currency, home, today=today)
+        for currency in in_play_currencies
+        if home is not None
+    }
+    return Reply(text=rates_reply(pins=pin_views, in_play=in_play, home=home))
+
+
+async def _run_autorate(
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
+) -> Reply:
+    base, quote = parse_autorate(message["text"])
+    ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
+    applied = await apply_intent(ClearFxRate(base=base, quote=quote), ctx)
+    assert applied is not None
+    return Reply(text=_autorate_text(base, quote), undo_action_id=applied.action_id)
+
+
+def _autorate_text(base: str, quote: str) -> str:
+    return (
+        f"💱 {base}→{quote} unpinned — ≈ figures follow the live daily rate again. "
+        f"Pin one anytime: /setrate {base} {quote} 1.35"
+    )
+
+
 async def _run_currency(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     currency = parse_currency(message["text"])
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
@@ -1830,7 +2008,7 @@ async def _run_currency(
 
 
 async def _run_newledger(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     name, currency = parse_newledger(message["text"])
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
@@ -1840,7 +2018,7 @@ async def _run_newledger(
 
 
 async def _run_switch(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     name_or_id = parse_switch(message["text"])
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
@@ -1850,7 +2028,7 @@ async def _run_switch(
 
 
 async def _run_archive(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     name_or_id = parse_archive(message["text"])
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
@@ -1860,7 +2038,7 @@ async def _run_archive(
 
 
 async def _run_unarchive(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     name_or_id = parse_unarchive(message["text"])
     ctx = ApplyContext(session=session, group=group, actor=actor, seed=message["message_id"])
@@ -1870,7 +2048,7 @@ async def _run_unarchive(
 
 
 async def _run_ledgers(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     # a read: no lock, no action row (§0.7); the one place other ledgers are visible
     lines = [
@@ -1887,7 +2065,7 @@ async def _run_ledgers(
 
 
 async def _run_members(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     # a container-inspection read (ADR-0011): slash-only, no lock, no action row (§0.7)
     parse_members(message["text"])  # no-arg guard; a trailing token is a usage error
@@ -1903,7 +2081,7 @@ async def _run_members(
 
 
 async def _run_transactions(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     parse_transactions(message["text"])  # no-arg guard; a trailing token is a usage error
     return await _transactions_reply(session, group)
@@ -1922,7 +2100,11 @@ async def _transactions_reply(session: AsyncSession, group: Group) -> Reply:
 
 def _expense_runner(parse: Callable[[str], ParsedExpense]) -> CommandRunner:
     async def run(
-        message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+        message: dict[str, Any],
+        session: AsyncSession,
+        group: Group,
+        actor: User | None,
+        deps: Deps,
     ) -> Reply:
         return await _run_expense(message, session, group, actor, parse(message["text"]))
 
@@ -2002,12 +2184,12 @@ async def _run_expense(
 
 
 async def _run_settle(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     parsed = parse_settle(message["text"])
     if parsed.amount is None:
         sheet_intent = SettleUp(from_ref=parsed.from_ref, to_ref=parsed.to_ref)
-        return await _sheet_reply(sheet_intent, session, group, actor)
+        return await _sheet_reply(sheet_intent, session, group, actor, deps)
     assert parsed.currency is not None
     # the currency is explicit on /settle (§4): no active-ledger resolution, so
     # minor-unit conversion can happen before the lock. It also runs before apply's
@@ -2035,18 +2217,29 @@ async def _run_settle(
 
 
 async def _sheet_reply(
-    intent: SettleUp, session: AsyncSession, group: Group, actor: User | None
+    intent: SettleUp, session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     """The settle sheet (ADR-0007), shared by /settle and NL: a read — no lock,
     no action row (§0.7); the buttons' WYSIWYG amount tokens guard staleness."""
     pair = await resolve_refs(session, group.id, [intent.from_ref, intent.to_ref], actor)
     ledger = await session.get_one(Ledger, group.active_ledger_id)
-    text, markup = await sheet_view(session, ledger, pair[intent.from_ref], pair[intent.to_ref])
-    return Reply(text=text, markup=markup)
+    net = await net_positions(session, ledger.id)  # replayed ONCE: sheet + freshness share it
+    text, markup = await sheet_view(
+        session, ledger, pair[intent.from_ref], pair[intent.to_ref], net=net
+    )
+    # a ledger read joins the §13 board-freshness pact: refresh the ledger's
+    # in-play pairs per the TTL, and re-render the board if anything landed
+    currencies = {c for by_currency in net.values() for c, minor in by_currency.items() if minor}
+    _, fetched = await _rates_for_currencies(session, group, currencies, deps)
+    return Reply(
+        text=text,
+        markup=markup,
+        board_sync=await _read_triggered_board_refresh(session, group, deps, fetched),
+    )
 
 
 async def _run_delete(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     explicit_id = parse_delete(message["text"])
     expense_id = await _referenced_expense_id(message, session, group, explicit_id, DELETE_USAGE)
@@ -2066,7 +2259,7 @@ async def _run_delete(
 
 
 async def _run_edit(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     parsed = parse_edit(message["text"])
     expense_id = await _referenced_expense_id(
@@ -2116,14 +2309,14 @@ async def _referenced_expense_id(
 
 
 async def _run_balance(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     intent = ShowBalance(scope=parse_balance(message["text"]))
-    return await _balance_reply(intent, session, group, actor)
+    return await _balance_reply(intent, session, group, actor, deps)
 
 
 async def _balance_reply(
-    intent: ShowBalance, session: AsyncSession, group: Group, actor: User | None
+    intent: ShowBalance, session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     """The show_balance read, shared by /balance and NL (§4: one Intent contract)."""
     # a read: no lock, no action row, sealed to the active ledger (§0.7, §0.10, §8)
@@ -2133,14 +2326,72 @@ async def _balance_reply(
         if actor is None:
             raise Rejection("I can't tell who you are — anonymous admins have no balance.")
         entries = [(actor.display_name, net.get(actor.id, {}))]
-        return Reply(text=balance_reply(ledger_name=ledger.name, entries=entries, as_me=True))
-    names = await display_names(session, list(net))
-    entries = [(names[user_id], by_currency) for user_id, by_currency in net.items()]
-    return Reply(text=balance_reply(ledger_name=ledger.name, entries=entries))
+        as_me = True
+    else:
+        names = await display_names(session, list(net))
+        entries = [(names[user_id], by_currency) for user_id, by_currency in net.items()]
+        as_me = False
+    currencies = {c for _, by_currency in entries for c in by_currency}
+    if intent.convert_to is not None:
+        # /convert (§7.6): consolidate per member into the TARGET, not home
+        target = require_known_currency(intent.convert_to)  # ADR-0009: an input edge
+        target_rates, fetched = await equivalents_view(
+            session, group.id, deps.fx, currencies, target, today=today_utc()
+        )
+        return Reply(
+            text=convert_reply(
+                ledger_name=ledger.name,
+                target=target,
+                entries=entries,
+                rates=target_rates,
+                as_me=as_me,
+            ),
+            board_sync=await _read_triggered_board_refresh(session, group, deps, fetched),
+        )
+    rates, fetched = await _rates_for_currencies(session, group, currencies, deps)
+    return Reply(
+        text=balance_reply(
+            ledger_name=ledger.name,
+            entries=entries,
+            as_me=as_me,
+            home=group.home_currency,
+            rates=rates,
+        ),
+        board_sync=await _read_triggered_board_refresh(session, group, deps, fetched),
+    )
+
+
+async def _rates_for_currencies(
+    session: AsyncSession,
+    group: Group,
+    currencies: set[str],
+    deps: Deps,
+) -> tuple[dict[str, Any] | None, bool]:
+    """The ≈ layer's rates for the buckets about to render (§7.6): refreshes the
+    API cache per the same-day TTL first — a display read, never ledger math."""
+    if group.home_currency is None:
+        return None, False
+    return await equivalents_view(
+        session, group.id, deps.fx, currencies, group.home_currency, today=today_utc()
+    )
+
+
+async def _read_triggered_board_refresh(
+    session: AsyncSession, group: Group, deps: Deps, fetched: bool
+) -> list[OutboundAction]:
+    """§13: a ledger read whose TTL refresh actually landed fresh rates re-renders
+    the board — the fetch already happened OUTSIDE the lock; only the render +
+    edit run under it, so it can't race a concurrent write's board edit."""
+    if not fetched:
+        return []
+    await per_group_lock(session, group.id)
+    await session.refresh(group)  # post-lock re-read (ADR-0003)
+    assert group.active_ledger_id is not None  # ensure_group invariant (ADR-0004)
+    return await sync_board(session, group, group.active_ledger_id, deps.client)
 
 
 async def _run_setup(
-    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
+    message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None, deps: Deps
 ) -> Reply:
     """/setup registers pre-existing members (§11): reply target and text_mentions.
 
@@ -2208,6 +2459,10 @@ _RUNNERS: dict[str, CommandRunner] = {
     "setup": _run_setup,
     "homecurrency": _run_homecurrency,
     "currency": _run_currency,
+    "setrate": _run_setrate,
+    "autorate": _run_autorate,
+    "rates": _run_rates,
+    "convert": _run_convert,
     "newledger": _run_newledger,
     "ledgers": _run_ledgers,
     "members": _run_members,

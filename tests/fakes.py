@@ -76,3 +76,35 @@ class FakeFiles:
     async def download_file(self, file_id: str) -> bytes | None:
         self.requested.append(file_id)
         return self.content
+
+
+class FakeFx:
+    """FxProvider double: canned EUR-based rates, records what was requested."""
+
+    def __init__(self, eur_based: dict[str, float] | None = None) -> None:
+        self.eur_based = eur_based or {}
+        self.requested: list[set[str]] = []
+
+    async def eur_rates(self, symbols: set[str]) -> dict[str, float] | None:
+        self.requested.append(set(symbols))
+        # like Frankfurter: unsupported symbols are simply absent from the answer
+        return {s: self.eur_based[s] for s in symbols if s in self.eur_based}
+
+
+class UnavailableFx:
+    """FxProvider double for an API outage: every fetch comes back empty-handed."""
+
+    def __init__(self) -> None:
+        self.requested: list[set[str]] = []
+
+    async def eur_rates(self, symbols: set[str]) -> dict[str, float] | None:
+        self.requested.append(set(symbols))
+        return None
+
+
+class PoisonedFx:
+    """FxProvider double for the ADR-0001 boundary proof: FX transport must never
+    be touched on a write path — any call is an immediate test failure."""
+
+    async def eur_rates(self, symbols: set[str]) -> dict[str, float] | None:
+        raise AssertionError("FX transport touched on a write path")

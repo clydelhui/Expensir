@@ -8,6 +8,7 @@ import uvicorn
 from expensir.config import Settings
 from expensir.core.handler import Deps
 from expensir.db.session import make_session_factory
+from expensir.fx.frankfurter import FrankfurterClient
 from expensir.llm.base import LLMClient
 from expensir.llm.openai_compat import OpenAICompatLLM
 from expensir.telegram.client import HttpxTelegramClient
@@ -44,6 +45,8 @@ async def _run(settings: Settings) -> None:
         llm=_make_llm(settings),
         files=telegram,  # photo bytes for the vision door (issue #15)
         pending_ttl_minutes=settings.pending_ttl_minutes,
+        # no key needed, so always on (§7.5); an outage degrades display only
+        fx=FrankfurterClient(base_url=settings.fx_api_base),
     )
 
     if settings.mode == "poll":

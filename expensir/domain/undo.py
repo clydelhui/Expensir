@@ -24,6 +24,7 @@ from expensir.db.models import (
     utcnow,
 )
 from expensir.domain.errors import Rejection
+from expensir.domain.fx import restore_pin
 from expensir.domain.identity import display_names
 from expensir.domain.ledgers import has_transactions, most_recent_open
 from expensir.domain.money import fmt
@@ -39,6 +40,8 @@ REVERSIBLE_KINDS = {
     "edit_expense",
     "set_home_currency",
     "set_logging_currency",
+    "set_fx_rate",
+    "clear_fx_rate",
     "new_ledger",
     "switch_ledger",
     "archive_ledger",
@@ -198,6 +201,15 @@ async def _reverse(session: AsyncSession, action: Action, group: Group, now: dat
     elif action.kind == "set_home_currency":
         assert action.before_image is not None
         group.home_currency = action.before_image["home_currency"]
+    elif action.kind in ("set_fx_rate", "clear_fx_rate"):
+        assert action.before_image is not None
+        await restore_pin(
+            session,
+            group.id,
+            action.intent_json["base"],
+            action.intent_json["quote"],
+            action.before_image["pin"],
+        )
     elif action.kind == "new_ledger":
         await _reverse_new_ledger(session, action, group, now)
     elif action.kind == "switch_ledger":
@@ -288,6 +300,26 @@ async def _reapply(session: AsyncSession, action: Action, group: Group) -> None:
         expense.edited_at = max(filter(None, (others, action.created_at)))
     elif action.kind == "set_home_currency":
         group.home_currency = action.intent_json["currency"]
+    elif action.kind == "set_fx_rate":
+        # redo restates the action's own pin; fetched_at = when it was first made
+        await restore_pin(
+            session,
+            group.id,
+            action.intent_json["base"],
+            action.intent_json["quote"],
+            {
+                "base": action.intent_json["base"],
+                "quote": action.intent_json["quote"],
+                "rate": action.intent_json["rate"],
+                "fetched_at": action.created_at.isoformat(),
+                "set_by": action.actor_user_id,
+            },
+        )
+    elif action.kind == "clear_fx_rate":
+        # redo re-clears: back to live rates, whatever pin stands now
+        await restore_pin(
+            session, group.id, action.intent_json["base"], action.intent_json["quote"], None
+        )
     elif action.kind == "new_ledger":
         ledger = await session.get_one(Ledger, action.ledger_id)
         ledger.status = "open"

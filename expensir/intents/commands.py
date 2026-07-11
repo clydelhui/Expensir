@@ -28,6 +28,21 @@ NEWLEDGER_USAGE = "Usage: /newledger <name> [ISO], e.g. /newledger Tokyo JPY"
 SWITCH_USAGE = "Usage: /switch <ledger>, e.g. /switch Tokyo — /ledgers to see them"
 UNARCHIVE_USAGE = "Usage: /unarchive <ledger>, e.g. /unarchive Tokyo — /ledgers to see them"
 CURRENCY_USAGE = "Usage: /currency <ISO>, e.g. /currency JPY"
+CONVERT_USAGE = (
+    "Usage: /convert SGD — everyone's balance consolidated into one currency. "
+    "Read-only and approximate; the books keep their own currencies."
+)
+RATES_USAGE = (
+    "Usage: /rates — the group's pinned rates and today's live rates. It takes no arguments."
+)
+AUTORATE_USAGE = (
+    "Usage: /autorate USD SGD — unpins the pair so ≈ figures use the live daily "
+    "rate again. /rates shows what's pinned."
+)
+SETRATE_USAGE = (
+    "Usage: /setrate USD SGD 1.35 — pins the rate my ≈ figures use, until you "
+    "/setrate again or /autorate USD SGD. Leave the number off to pin today's live rate."
+)
 SETTLE_USAGE = (
     "Usage: /settle [@from] @to <amount> <ISO>, e.g. /settle @alice 30 EUR — "
     "records that @from (you, if omitted) paid @to. Bare /settle @name shows "
@@ -269,6 +284,46 @@ def parse_unarchive(text: str) -> str:
     if not name:
         raise ValueError(UNARCHIVE_USAGE)
     return name
+
+
+@dataclass
+class ParsedSetRate:
+    """'/setrate USD SGD 1.35'; rate None is the fetch-and-pin form (§7.5)."""
+
+    base: str
+    quote: str
+    rate: str | None
+
+
+def parse_setrate(text: str) -> ParsedSetRate:
+    tokens = text.split()[1:]
+    if len(tokens) not in (2, 3) or not _ANY_ISO.match(tokens[0]) or not _ANY_ISO.match(tokens[1]):
+        raise ValueError(SETRATE_USAGE)
+    rate = None
+    if len(tokens) == 3:
+        if not _AMOUNT.match(tokens[2]):
+            raise ValueError(SETRATE_USAGE)
+        rate = tokens[2]
+    return ParsedSetRate(base=tokens[0].upper(), quote=tokens[1].upper(), rate=rate)
+
+
+def parse_convert(text: str) -> str:
+    """'/convert SGD' -> 'SGD': the consolidation target (§7.6)."""
+    return _parse_iso(text, CONVERT_USAGE)
+
+
+def parse_rates(text: str) -> None:
+    """/rates takes no arguments: any trailing token is a usage error."""
+    if text.split()[1:]:
+        raise ValueError(RATES_USAGE)
+
+
+def parse_autorate(text: str) -> tuple[str, str]:
+    """'/autorate USD SGD' -> ('USD', 'SGD'): the pair to put back on live rates."""
+    tokens = text.split()[1:]
+    if len(tokens) != 2 or not _ANY_ISO.match(tokens[0]) or not _ANY_ISO.match(tokens[1]):
+        raise ValueError(AUTORATE_USAGE)
+    return tokens[0].upper(), tokens[1].upper()
 
 
 def parse_homecurrency(text: str) -> str:
