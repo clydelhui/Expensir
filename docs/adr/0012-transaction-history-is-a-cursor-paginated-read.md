@@ -51,4 +51,7 @@ active. Pager buttons are inline callbacks, so whatever position state exists mu
 - The `v1:tx` grammar is versioned like every callback; filters would need a new verb or version,
   since filter state must also fit the 64-byte budget.
 - `show_transactions` few-shots must teach the LLM to collapse qualified asks ("last 3 expenses")
-  to the plain listing rather than hallucinate parameters.
+  to the plain listing rather than hallucinate parameters. The line against `show_balance` is
+  owes-vs-spent: OWE-shaped asks ("what do I owe?") parse as `show_balance`; SPENT-shaped asks
+  parse as `show_transactions` — including total-shaped ones ("how much did we spend?"), which
+  are answered approximately by the listing rather than bounced as `unknown` (issue #26 grill).

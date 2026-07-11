@@ -31,6 +31,7 @@ from expensir.llm.wire import (
     WireSettleUp,
     WireSetup,
     WireShowBalance,
+    WireShowTransactions,
     WireSplitMember,
     WireSwitchLedger,
     WireUnarchiveLedger,
@@ -565,6 +566,40 @@ async def test_an_nl_balance_read_runs_immediately_without_a_proposal(deps):
     assert send.kind == "send_message"
     assert "You're owed SGD 20.00" in send.text  # Alice fronted Sam's half of dinner
     assert send.reply_markup is None  # a read: no Confirm/Cancel, no Undo (§0.7)
+    async with deps.session_factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(PendingIntent))
+        ).scalar() == 0
+
+
+async def test_an_nl_history_ask_matches_the_slash_listing_pager_included(deps):
+    """Issue #26 acceptance: one runner, both doors — identical text and pager,
+    answered inline as a read (ADR-0012, ADR-0011), no proposal parked."""
+    await arrange_group(deps)
+    for n in range(11):  # spill past one page so the listing carries a ▶ pager
+        await dispatch(
+            message_update(
+                update_id=100 + n,
+                text=f"/equal 10 SGD snack{n}",
+                from_user=ALICE,
+                message_id=100 + n,
+            ),
+            deps,
+        )
+    [slash] = await dispatch(
+        message_update(update_id=200, text="/transactions", from_user=ALICE, message_id=200),
+        deps,
+    )
+    deps.llm = FakeLLM([WireShowTransactions()])
+
+    actions = await mention(deps, "what did we spend?", update_id=201, message_id=201)
+
+    (send,) = actions
+    assert send.kind == "send_message"
+    assert send.text == slash.text
+    assert send.reply_markup == slash.reply_markup
+    buttons = keyboard_buttons(send.reply_markup)
+    assert any(data.startswith("v1:tx:") for _, data in buttons)  # the pager, not an action row
     async with deps.session_factory() as session:
         assert (
             await session.execute(select(func.count()).select_from(PendingIntent))

@@ -46,6 +46,11 @@ class WireShowBalance(BaseModel):
     confidence: float | None = None
 
 
+class WireShowTransactions(BaseModel):
+    kind: Literal["show_transactions"] = "show_transactions"
+    confidence: float | None = None
+
+
 class WireDeleteExpense(BaseModel):
     kind: Literal["delete_expense"] = "delete_expense"
     expense_id: int | None = None  # a bare #id in the text; None -> the reply names it (§11)
@@ -126,6 +131,7 @@ WireResult = Annotated[
     WireAddExpense
     | WireSettleUp
     | WireShowBalance
+    | WireShowTransactions
     | WireDeleteExpense
     | WireEditExpense
     | WireNewLedger

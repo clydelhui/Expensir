@@ -123,6 +123,7 @@ async def test_the_system_prompt_defines_the_wire_contract():
         "add_expense",
         "settle_up",
         "show_balance",
+        "show_transactions",
         "delete_expense",
         "edit_expense",
         "new_ledger",

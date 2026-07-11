@@ -206,6 +206,146 @@
     }
   },
   {
+    "name": "show_transactions_plain",
+    "utterance": "what did we spend?",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"show_transactions\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "show_transactions"
+    }
+  },
+  {
+    "name": "show_transactions_total_shaped_is_history_not_balance",
+    "utterance": "how much did we spend?",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"show_transactions\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "show_transactions"
+    }
+  },
+  {
+    "name": "show_transactions_count_qualifier_collapses",
+    "utterance": "show the last 3 expenses",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"show_transactions\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "show_transactions"
+    }
+  },
+  {
+    "name": "show_transactions_category_qualifier_collapses",
+    "utterance": "what did we spend on food?",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"show_transactions\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "show_transactions"
+    }
+  },
+  {
+    "name": "show_transactions_person_qualifier_collapses",
+    "utterance": "show Bob's expenses",
+    "response": {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "created": 1751900000,
+      "model": "recorded",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"kind\": \"show_transactions\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 900,
+        "completion_tokens": 60,
+        "total_tokens": 960
+      }
+    },
+    "expected": {
+      "kind": "show_transactions"
+    }
+  },
+  {
     "name": "delete_by_visible_id",
     "utterance": "delete #42",
     "response": {

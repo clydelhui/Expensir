@@ -121,6 +121,7 @@ from expensir.intents.schema import (
     Setup,
     SetupTarget,
     ShowBalance,
+    ShowTransactions,
     SplitMember,
     SwitchLedger,
     UnarchiveLedger,
@@ -1223,6 +1224,11 @@ async def _handle_reply_to_pending(
                 ),
             )
         ]
+    if image is not None and not isinstance(wire, WireAddExpense | WireSettleUp | WireUnknown):
+        # a photo only ever means money moving (§12): the same coercion as the
+        # fresh photo door — the model is never trusted to widen its own door
+        # (§0), however the conflicting refine/vision addenda resolve
+        wire = WireUnknown(reason=f"vision refine produced a non-photo kind: {wire.kind}")
     if isinstance(wire, WireUndoRedo):
         # detected, never honored (§9) — and not a correction: proposal untouched
         return [SendMessage(chat_id=pending.chat_id, text=UNDO_POINTER)]
@@ -1557,6 +1563,8 @@ async def _nl_read_reply(
         )
     if isinstance(intent, ShowBalance):
         return await _balance_reply(intent, session, group, actor)
+    if isinstance(intent, ShowTransactions):
+        return await _transactions_reply(session, group)
     if isinstance(intent, SettleUp) and intent.amount_minor is None:
         return await _sheet_reply(intent, session, group, actor)
     return None
@@ -1897,8 +1905,13 @@ async def _run_members(
 async def _run_transactions(
     message: dict[str, Any], session: AsyncSession, group: Group, actor: User | None
 ) -> Reply:
-    # a content read (ADR-0012): no lock, no action row, active ledger only (§0.7, §0.10)
     parse_transactions(message["text"])  # no-arg guard; a trailing token is a usage error
+    return await _transactions_reply(session, group)
+
+
+async def _transactions_reply(session: AsyncSession, group: Group) -> Reply:
+    """The show_transactions read, shared by /transactions and NL (§4: one Intent contract)."""
+    # a content read (ADR-0012): no lock, no action row, active ledger only (§0.7, §0.10)
     ledger = await session.get_one(Ledger, group.active_ledger_id)
     page = await list_transactions(session, ledger.id, limit=PAGE_SIZE)
     return Reply(
