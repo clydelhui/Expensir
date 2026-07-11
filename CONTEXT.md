@@ -14,6 +14,10 @@ _Avoid_: chat, room, team
 A self-contained book of expenses and settlements within a group. Balances and settlements never cross ledger boundaries. Typically one per trip or shared context; a group always has exactly one active ledger.
 _Avoid_: book, account, tab
 
+**Starter ledger**:
+The ledger the bot creates and announces when it joins a group, named after the chat, so an active ledger exists before anyone creates one deliberately. If it is still empty when the group creates its first ledger of its own, it is archived in that same action — a starter ledger never silently becomes active again. Once it holds a transaction it is an ordinary ledger.
+_Avoid_: decoy ledger, default ledger, auto-created ledger
+
 **Archived ledger**:
 A ledger closed to new activity. Its balances are preserved and readable, but it cannot become active while archived — switching to it is refused until it is explicitly unarchived. Unarchiving reopens it without making it active; reopening and switching are separate, deliberate steps.
 _Avoid_: deleted ledger, closed ledger
@@ -114,7 +118,7 @@ A reply — text or receipt photo — to a live proposal that rewrites its inten
 _Avoid_: edit (reserved for editing a committed expense), amendment
 
 **Pick-list**:
-A pre-confirm stage on a proposal that presents one ambiguous reference — a member name or a described expense matching more than one candidate — as tap-to-choose options. Slots resolve one at a time, by tap or by correction; a choice pins the slot to a concrete member or expense, and Confirm appears only once every slot is pinned. Ambiguity discovered at any point — at propose, after a correction, or on a confirm tap — puts the proposal (back) in this stage: the bot never guesses. Slot pinning is distinct from a proposal's pinned ledger and from the pinned board.
+A pre-confirm stage on a proposal that presents one ambiguous reference — a member name or a described expense matching more than one candidate, or an unknown name that is a near-miss of a registered member — as tap-to-choose options. Slots resolve one at a time, by tap or by correction; a choice pins the slot to a concrete member or expense, and Confirm appears only once every slot is pinned — except that when a single candidate would pin the last open slot, choosing it confirms in the same tap. The bot still never guesses: it asks, and a tap answers. Ambiguity discovered at any point — at propose, after a correction, or on a confirm tap — puts the proposal (back) in this stage: the bot never guesses. Slot pinning is distinct from a proposal's pinned ledger and from the pinned board.
 _Avoid_: picker (reserved for the guided /add flow), menu
 
 **Action**:
