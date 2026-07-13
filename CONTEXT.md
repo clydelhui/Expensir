@@ -43,7 +43,7 @@ The single currency, set per group, that every balance and board figure is addit
 _Avoid_: base currency, default currency, group currency
 
 **Logging currency**:
-The default currency for *new* expenses in a given ledger. Set per ledger; overridable per expense; resolves to the home currency when unset. Distinct from the home currency: a ledger may log in JPY while the group's home currency is USD. It is only a default-picker — once an expense is written it freezes its own currency, so later changes to the logging or home currency never re-denominate existing transactions.
+The default currency for *new* expenses in a given ledger. Set per ledger; overridable per expense; resolves to the home currency when unset. Distinct from the home currency: a ledger may log in JPY while the group's home currency is USD. It is only a default-picker — once an expense is written it freezes its own currency, so later changes to the logging or home currency never re-denominate existing transactions. Not to be confused with diagnostic log output — "logging" unqualified in this glossary always means the currency; log lines are infrastructure, not domain.
 _Avoid_: default currency, ledger currency
 
 **Equivalent** (`≈`):

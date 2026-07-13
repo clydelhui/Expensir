@@ -8,7 +8,9 @@ id; the photo travels as a base64 data URL, never a Telegram file URL.
 
 import base64
 import json
+import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -22,6 +24,8 @@ from expensir.llm.prompts import (
     vision_extraction_messages,
 )
 from expensir.llm.wire import WireResult, WireUnknown
+
+logger = logging.getLogger(__name__)
 
 _WIRE: TypeAdapter[WireResult] = TypeAdapter(WireResult)
 
@@ -89,6 +93,7 @@ class OpenAICompatLLM:
             return WireUnknown(reason="the model's output failed validation twice")
 
     async def _chat(self, messages: list[dict[str, Any]], model: str) -> str:
+        started = time.monotonic()
         try:
             response = await self._http.post(
                 f"{self._base_url}/chat/completions",
@@ -100,7 +105,12 @@ class OpenAICompatLLM:
             # includes non-2xx statuses: the sentence never reached a model, so
             # the caller must not answer with "rephrase that" (§12)
             raise LLMUnavailable(str(exc)) from exc
-        return str(response.json()["choices"][0]["message"]["content"])
+        content = str(response.json()["choices"][0]["message"]["content"])
+        logger.info("llm reply ok model=%s %dms", model, (time.monotonic() - started) * 1000)
+        # only the reply at DEBUG: the request repeats the user text (already
+        # logged at the NL door) and a vision request is a megabyte of base64
+        logger.debug("llm reply content: %s", content)
+        return content
 
 
 def _data_url(image: bytes) -> str:

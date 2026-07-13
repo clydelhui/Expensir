@@ -6,6 +6,7 @@ key, ECB daily, EUR-based; non-EUR pairs triangulate app-side (domain/fx.py).
 """
 
 import logging
+import time
 
 import httpx
 
@@ -27,6 +28,7 @@ class FrankfurterClient:
     async def eur_rates(self, symbols: set[str]) -> dict[str, float] | None:
         """Today's EUR-based rates for `symbols` (§7.5). Unsupported symbols are
         simply absent from the answer; None = the API couldn't be reached."""
+        started = time.monotonic()
         try:
             response = await self._http.get(
                 f"{self._base}/v1/latest",
@@ -38,7 +40,14 @@ class FrankfurterClient:
                 response = await self._http.get(f"{self._base}/v1/latest", params={"base": "EUR"})
             response.raise_for_status()
             rates = response.json().get("rates", {})
-            return {s: float(rates[s]) for s in symbols if s in rates}
+            resolved = {s: float(rates[s]) for s in symbols if s in rates}
+            logger.info(
+                "fx rates fetched %d/%d symbols %dms",
+                len(resolved),
+                len(symbols),
+                (time.monotonic() - started) * 1000,
+            )
+            return resolved
         except (httpx.HTTPError, ValueError, TypeError, AttributeError):
             logger.warning("frankfurter fetch failed; cached rates stand", exc_info=True)
             return None

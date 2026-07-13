@@ -11,6 +11,7 @@ from expensir.db.session import make_session_factory
 from expensir.fx.frankfurter import FrankfurterClient
 from expensir.llm.base import LLMClient
 from expensir.llm.openai_compat import OpenAICompatLLM
+from expensir.logsetup import setup_logging
 from expensir.telegram.client import HttpxTelegramClient
 from expensir.transports.poll import run_poll
 from expensir.transports.webhook import create_app
@@ -53,12 +54,21 @@ async def _run(settings: Settings) -> None:
         await run_poll(deps, telegram)
     else:
         app = create_app(deps, telegram, settings.telegram_webhook_secret)
-        config = uvicorn.Config(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+        # log_config=None: uvicorn's records propagate into our root handler (one
+        # format); access_log off — the update trace supersedes it (ADR-0015)
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", "8080")),
+            log_config=None,
+            access_log=False,
+        )
         await uvicorn.Server(config).serve()
 
 
 def main() -> None:
     settings = Settings()  # type: ignore[call-arg]  # fields come from env/.env at runtime
+    setup_logging(settings.log_level, settings.log_file)
     asyncio.run(_run(settings))
 
 

@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # display rates (§7.5): Frankfurter — free, no key, ECB daily, EUR-based.
     # DISPLAY ONLY; an outage degrades ≈ lines to cached/dated/(≈ n/a), nothing else.
     fx_api_base: str = "https://api.frankfurter.dev"
+    # diagnostic logs (ADR-0015): drives expensir loggers only, noisy libraries
+    # stay pinned to WARNING; DEBUG adds message content — dev only
+    log_level: str = "INFO"
+    # optional rotating dev log file; leave unset in prod (Cloud Run reads stderr)
+    log_file: str | None = None
 
     @field_validator(
         "public_url",
@@ -41,11 +46,17 @@ class Settings(BaseSettings):
         "llm_api_key",
         "llm_model",
         "llm_vision_model",
+        "log_file",
         mode="before",
     )
     @classmethod
     def _blank_env_value_means_unset(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _blank_log_level_means_default(cls, value: object) -> object:
+        return "INFO" if value == "" else value
 
     @model_validator(mode="after")
     def _webhook_mode_needs_a_secret(self) -> Self:

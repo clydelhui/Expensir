@@ -1,6 +1,8 @@
 """Performs the OutboundActions the core returns as data (§0.12)."""
 
 import logging
+import time
+from collections import Counter
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -16,7 +18,11 @@ async def execute(
     client: TelegramClient,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
+    started = time.monotonic()
+    counts: Counter[str] = Counter()
     for action in actions:
+        counts[action.kind] += 1
+        logger.debug("effect %s: %r", action.kind, action)
         if action.kind == "send_message":
             sent = await client.send_message(
                 chat_id=action.chat_id, text=action.text, reply_markup=action.reply_markup
@@ -77,6 +83,9 @@ async def execute(
                 )
             except Exception:
                 logger.warning("answerCallbackQuery failed", exc_info=True)
+    if actions:
+        summary = " ".join(f"{kind}={n}" for kind, n in counts.items())
+        logger.info("effects sent %s %dms", summary, (time.monotonic() - started) * 1000)
 
 
 async def _record_result(

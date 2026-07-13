@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -157,6 +158,8 @@ from expensir.llm.wire import (
     WireUndoRedo,
     WireUnknown,
 )
+
+logger = logging.getLogger(__name__)
 
 _TOGGLE_DATA = re.compile(r"^v1:(undo|redo):(\d+)$")
 # Confirm/Cancel on a proposal (§10), keyed by the pending row's id
@@ -324,26 +327,29 @@ async def dispatch(update: dict[str, Any], deps: Deps) -> list[OutboundAction]:
 
 async def _handle_callback_query(callback: dict[str, Any], deps: Deps) -> list[OutboundAction]:
     """Undo/redo (§9) and board [Settle] (ADR-0006) button presses."""
+    data = callback.get("data") or ""
+    verb = data.split(":")[1] if data.startswith("v1:") and data.count(":") >= 2 else "unknown"
+    logger.info("intent=cb:%s", verb)
     ack = AnswerCallbackQuery(callback_query_id=callback["id"])
-    confirm = _CONFIRM_DATA.match(callback.get("data") or "")
+    confirm = _CONFIRM_DATA.match(data)
     if confirm is not None:
         return await _handle_confirm_tap(callback, confirm, deps)
-    pick = _PICK_DATA.match(callback.get("data") or "")
+    pick = _PICK_DATA.match(data)
     if pick is not None:
         return await _handle_pick_tap(callback, pick, deps)
-    pickx = _PICKX_DATA.match(callback.get("data") or "")
+    pickx = _PICKX_DATA.match(data)
     if pickx is not None:
         return await _handle_pickx_tap(callback, pickx, deps)
-    settle = _SETTLE_DATA.match(callback.get("data") or "")
+    settle = _SETTLE_DATA.match(data)
     if settle is not None:
         return await _handle_settle_tap(callback, settle, deps)
-    sheet = _SHEET_DATA.match(callback.get("data") or "")
+    sheet = _SHEET_DATA.match(data)
     if sheet is not None:
         return await _handle_sheet_tap(callback, sheet, deps)
-    tx = _TX_DATA.match(callback.get("data") or "")
+    tx = _TX_DATA.match(data)
     if tx is not None:
         return await _handle_tx_tap(callback, tx, deps)
-    match = _TOGGLE_DATA.match(callback.get("data") or "")
+    match = _TOGGLE_DATA.match(data)
     if match is None:
         return [ack]  # not a button of any slice so far; acknowledge so the spinner stops
     direction = cast(ToggleDirection, match.group(1))
@@ -1099,6 +1105,8 @@ async def _handle_group_message(message: dict[str, Any], deps: Deps) -> list[Out
             return []
 
         command = _command_of(message.get("text", ""), deps.bot_username)
+        if command is not None and (command in _INLINE_COMMANDS or command in _RUNNERS):
+            logger.info("intent=cmd:%s", command)
         if command == "start":
             active = await session.get_one(Ledger, group.active_ledger_id)
             text = f"📒 {active.name} • Expensir is ready — try /equal, or /balance."
@@ -1276,6 +1284,7 @@ async def _handle_reply_to_pending(
         # fresh photo door — the model is never trusted to widen its own door
         # (§0), however the conflicting refine/vision addenda resolve
         wire = WireUnknown(reason=f"vision refine produced a non-photo kind: {wire.kind}")
+    logger.info("intent=refine:%s", wire.kind)
     if isinstance(wire, WireUndoRedo):
         # detected, never honored (§9) — and not a correction: proposal untouched
         return [SendMessage(chat_id=pending.chat_id, text=UNDO_POINTER)]
@@ -1355,6 +1364,7 @@ async def _handle_nl_text(
     assert deps.llm is not None
     chat_id = message["chat"]["id"]
     stripped = _strip_bot_mention(message.get("text", ""), deps.bot_username)
+    logger.debug("nl text: %r", stripped)
     try:
         wire = await deps.llm.extract_text(stripped)
     except LLMUnavailable:
@@ -1369,6 +1379,7 @@ async def _handle_nl_text(
                 ),
             )
         ]
+    logger.info("intent=nl:%s", wire.kind)
     return await _run_fresh_wire(wire, message, session, group, actor, deps)
 
 
@@ -1501,6 +1512,7 @@ async def _handle_vision(
         # a photo only ever means money moving (§12): the restriction lives in
         # the prompt, but the model is never trusted to widen its own door (§0)
         wire = WireUnknown(reason=f"vision produced a non-photo kind: {wire.kind}")
+    logger.info("intent=vision:%s", wire.kind)
     if isinstance(wire, WireUnknown):
         # "try rephrasing" makes no sense for a photo (issue #15 grill)
         return [

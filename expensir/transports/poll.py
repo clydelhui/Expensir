@@ -1,8 +1,10 @@
 """getUpdates polling transport for local dev; feeds the same dispatch seam as webhook (§0.5)."""
 
 import logging
+import time
 
 from expensir.core.handler import Deps, dispatch
+from expensir.logsetup import current_update_id, update_log_fields
 from expensir.telegram.client import PollingTelegramClient
 from expensir.transports.executor import execute
 
@@ -18,9 +20,14 @@ async def poll_once(deps: Deps, client: PollingTelegramClient, offset: int) -> i
             # KeyError past the error boundary and take the loop down
             logger.warning("skipping update with no update_id: %r", update)
             continue
+        token = current_update_id.set(update_id)
+        started = time.monotonic()
         try:
+            logger.info("received %s", update_log_fields(update))
+            logger.debug("update payload: %r", update)
             actions = await dispatch(update, deps)
             await execute(actions, client, session_factory=deps.session_factory)
+            logger.info("done outcome=ok %dms", (time.monotonic() - started) * 1000)
         except Exception:
             # advancing the offset on ANY failure is deliberate: poll has no
             # update_id dedupe (that lives in the webhook transport), so NOT
@@ -29,7 +36,12 @@ async def poll_once(deps: Deps, client: PollingTelegramClient, offset: int) -> i
             # never reprocess — the poll mirror of the webhook's kept-claim
             # tradeoff (§0.2). A deterministic handler bug is likewise dropped
             # here rather than blocking every later update behind it.
-            logger.exception("dropping update %s after an error", update_id)
+            logger.exception(
+                "done outcome=error %dms — update dropped, offset advances",
+                (time.monotonic() - started) * 1000,
+            )
+        finally:
+            current_update_id.reset(token)
         offset = max(offset, update_id + 1)
     return offset
 
